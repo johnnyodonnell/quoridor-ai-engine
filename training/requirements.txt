@@ -1,0 +1,10 @@
+numpy>=2.0
+onnx>=1.20
+onnxruntime>=1.20
+onnxscript
+safetensors>=0.4
+maturin>=1.0,<2.0
+pytest
+# torch is installed separately from the PyTorch nightly cu128 index:
+#   pip install --pre --index-url https://download.pytorch.org/whl/nightly/cu128 torch
+# quoridor_rs (the native extension) is built by quoridor_rs/build.sh.

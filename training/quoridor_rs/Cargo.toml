@@ -1,0 +1,20 @@
+[package]
+name = "quoridor_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Quoridor board, self-play pipeline and match engine (PyO3 extension)"
+
+[lib]
+name = "quoridor_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+quoridor_core = { path = "../quoridor_core" }
+pyo3 = { version = "0.24", features = ["extension-module"] }
+numpy = "0.24"
+rand = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
