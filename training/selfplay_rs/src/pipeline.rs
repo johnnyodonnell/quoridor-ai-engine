@@ -10,7 +10,14 @@
 //!   - global ply-priority queue of in-flight games (most plies first);
 //!   - N worker threads advance a game's FSM until it yields ONE leaf eval (send
 //!     to the leaf channel) or completes (hand rows to the sink); empty queue =>
-//!     spawn a fresh game (dynamic game count, self-regulates to fill the pipe);
+//!     spawn a fresh game (dynamic game count, self-regulates to fill the pipe).
+//!     Workers also do the dtype conversions on both edges of the forward: they
+//!     narrow the leaf encoding f32->bf16 before sending, and widen their own
+//!     output row bf16->f32 after, so the two singleton GPU-feeder threads stay
+//!     thin and the per-element work is spread across all N workers. The 16-bit
+//!     payload is carried host-side as raw bf16 bits in an i16 (tch 0.23
+//!     mis-types half::bf16 as Kind::Half, so we bitcast via Tensor::view_dtype
+//!     at the device boundary rather than relying on its bf16 Element);
 //!   - ONE bounded leaf channel (crossbeam, cap = (n_slots+1)*BATCH): workers
 //!     append lock-free and block only at capacity (backpressure);
 //!   - ONE inference thread: gathers BATCH leaves off the channel, copies them
@@ -38,6 +45,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver as LeafReceiver, Sender as LeafSender};
+use half::bf16;
 use quoridor_core::board::{Board, ENC_LEN, INPUT_CHANNELS, POLICY_SIZE, SIZE};
 use quoridor_core::mcts::{
     add_dirichlet_noise, advance_subtree, backprop, expand_node, sample_move, visits_to_pi,
@@ -88,9 +96,9 @@ struct LeafCtx {
     board: Board,
 }
 struct EvalResult {
-    logits: Arc<Vec<f32>>, // full batch policy [m * POLICY_SIZE]; sliced by `row`
+    logits: Arc<Vec<i16>>, // full batch policy [m * POLICY_SIZE] as raw bf16 bits; sliced by `row`
     row: usize,
-    value: f32,
+    value: i16, // this game's value as raw bf16 bits (widened by the worker)
 }
 /// A game in flight. Boxed so it moves queue<->channel<->worker by pointer.
 struct InFlight {
@@ -100,7 +108,7 @@ struct InFlight {
     phase: GamePhase,
     pending: Option<EvalResult>, // written by the scatter thread, consumed by a worker
     leaf_ctx: Option<LeafCtx>,   // Some exactly while an eval is outstanding
-    staged_enc: Vec<f32>,        // encoded leaf board, copied into the batch by inference
+    staged_enc: Vec<i16>,        // leaf encoding, already narrowed to bf16 (raw bits) by the worker
 }
 
 fn spawn_fresh(shared: &Shared) -> InFlight {
@@ -173,6 +181,17 @@ fn finalize_rows(g: &mut Game) -> Vec<Row> {
         .collect()
 }
 
+/// Encode a board and narrow it to bf16 (the dtype the forward consumes), carried
+/// as raw bf16 bits in an i16. Runs on the worker thread so the f32->bf16
+/// narrowing is spread across workers instead of done serially by the single
+/// inference thread when it fills a pinned slot. half's from_f32 rounds to
+/// nearest-even, like libtorch's cast, so the net sees identical inputs.
+fn encode_bf16_bits(board: &Board) -> Vec<i16> {
+    let mut buf = [0.0f32; ENC_LEN];
+    board.encode_into(&mut buf);
+    buf.iter().map(|&x| bf16::from_f32(x).to_bits() as i16).collect()
+}
+
 /// Pure-CPU move step: record (state, pi, turn), sample + push, advance the
 /// subtree, mark done on a win or the ply cap.
 fn step_move(g: &mut InFlight) {
@@ -195,7 +214,14 @@ fn step_move(g: &mut InFlight) {
 /// Apply the scatter-attached NN result to the tree, then advance the cursor.
 fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
     let ctx = g.leaf_ctx.take().expect("pending result without leaf_ctx");
-    let logits = &res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE];
+    // Widen only THIS game's row bf16->f32 here on the worker thread (parallel
+    // across workers), instead of widening the whole batch on the scatter thread.
+    let logits: Vec<f32> = res.logits[res.row * POLICY_SIZE..(res.row + 1) * POLICY_SIZE]
+        .iter()
+        .map(|&b| bf16::from_bits(b as u16).to_f32())
+        .collect();
+    let logits = &logits[..];
+    let value = bf16::from_bits(res.value as u16).to_f32();
     match ctx.kind {
         LeafKind::RootExpand => {
             expand_node(&mut g.game.arena, 0, &ctx.board, logits);
@@ -207,7 +233,7 @@ fn apply_result(g: &mut InFlight, res: EvalResult, config: &Config) {
         LeafKind::SimLeaf => {
             let leaf = *ctx.path.last().unwrap();
             expand_node(&mut g.game.arena, leaf, &ctx.board, logits);
-            backprop(&mut g.game.arena, &ctx.path, res.value as f64);
+            backprop(&mut g.game.arena, &ctx.path, value as f64);
             if let GamePhase::Simulating(s) = g.phase {
                 g.phase = GamePhase::Simulating(s + 1);
             }
@@ -235,7 +261,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                     continue;
                 }
                 let board = g.game.board.clone();
-                g.staged_enc = board.encode();
+                g.staged_enc = encode_bf16_bits(&board);
                 g.leaf_ctx = Some(LeafCtx {
                     kind: LeafKind::RootExpand,
                     path: vec![0],
@@ -261,7 +287,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
                         continue;
                     }
                     None => {
-                        g.staged_enc = board.encode();
+                        g.staged_enc = encode_bf16_bits(&board);
                         g.leaf_ctx = Some(LeafCtx {
                             kind: LeafKind::SimLeaf,
                             path,
@@ -275,7 +301,7 @@ fn advance_until_eval_or_done(g: &mut InFlight, config: &Config) -> Advance {
     }
 }
 
-fn requeue_scattered(shared: &Shared, logits: Arc<Vec<f32>>, values: &[f32], games: Vec<Box<InFlight>>) {
+fn requeue_scattered(shared: &Shared, logits: Arc<Vec<i16>>, values: &[i16], games: Vec<Box<InFlight>>) {
     let mut q = shared.queue.lock().unwrap();
     for (r, mut g) in games.into_iter().enumerate() {
         g.pending = Some(EvalResult {
@@ -332,12 +358,15 @@ fn worker_loop(
 }
 
 // --- inference + scatter (overlapped) ---------------------------------------
-/// bf16 CUDA tensor -> Vec<f32> on host. The D2H copy is bf16 (half the bytes of
-/// an f32 upcast-then-copy); the bf16->f32 widening happens on the CPU.
-fn bf16_to_vec_f32(t: &Tensor) -> Vec<f32> {
-    let c = t.to_device(Device::Cpu).to_kind(Kind::Float).contiguous();
+/// bf16 CUDA tensor -> raw bf16 bits (i16) on host. Just the D2H copy (bf16, half
+/// the bytes of an f32 upcast-then-copy); the bf16->f32 widening is deferred to
+/// the worker threads (apply_result), which widen only their own row in parallel.
+/// tch 0.23 mis-types half::bf16 as Kind::Half, so we bitcast the host bf16 tensor
+/// to Int16 (view_dtype = raw reinterpret, no numeric conversion) and copy the bits.
+fn bf16_d2h(t: &Tensor) -> Vec<i16> {
+    let c = t.to_device(Device::Cpu).contiguous().view_dtype(Kind::Int16);
     let n = c.numel();
-    let mut v = vec![0f32; n];
+    let mut v = vec![0i16; n];
     c.copy_data(&mut v, n);
     v
 }
@@ -438,10 +467,13 @@ impl Infer {
 
     /// Fill pinned slot `slot` with `m` rows, async-H2D, launch the forward, and
     /// record a completion event. Returns owned device tensors + event (all async;
-    /// the CPU does not block on the GPU here).
-    fn launch(&mut self, slot: usize, enc: &[f32], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
-        let src = Tensor::from_slice(enc).reshape([m as i64, C, S, S]); // CPU f32
-        self.pinned_in[slot].narrow(0, 0, m as i64).copy_(&src); // f32 -> bf16 into pinned
+    /// the CPU does not block on the GPU here). `enc` is already bf16 bits (narrowed
+    /// by the workers, carried as i16), so filling the pinned slot is a plain
+    /// bf16->bf16 memcpy with no per-element conversion on this single thread.
+    fn launch(&mut self, slot: usize, enc: &[i16], m: usize) -> (Tensor, Tensor, Tensor, CudaEvent) {
+        // i16 bits -> bf16 view (bitcast, no numeric conversion), then memcpy into pinned.
+        let src = Tensor::from_slice(enc).reshape([m as i64, C, S, S]).view_dtype(Kind::BFloat16);
+        self.pinned_in[slot].narrow(0, 0, m as i64).copy_(&src); // bf16 -> bf16 (memcpy) into pinned
         // async H2D from pinned memory (does not block the CPU).
         let x = self.pinned_in[slot].internal_to_copy((Kind::BFloat16, self.dev), true);
         let opts = (Kind::BFloat16, self.dev);
@@ -467,7 +499,7 @@ fn inference_thread(
 ) {
     cudagraph::set_side_stream(); // a non-default stream for all inference ops
     let mut infer = Infer::new(&shared.config, shared.config.n_slots.max(1));
-    let mut enc: Vec<f32> = Vec::with_capacity(BATCH * ENC_LEN); // reused scratch
+    let mut enc: Vec<i16> = Vec::with_capacity(BATCH * ENC_LEN); // reused scratch (bf16 bits staged by workers)
     loop {
         if shared.stop.load(AtomicOrdering::Relaxed) {
             return;
@@ -508,14 +540,15 @@ fn inference_thread(
     }
 }
 
-/// Consumer: wait each forward's event, read its bf16 outputs (D2H), requeue the
-/// games, and recycle the pinned slot. Overlaps the inference thread's next forward.
+/// Consumer: wait each forward's event, copy its bf16 outputs back (D2H only, no
+/// widening), requeue the games, and recycle the pinned slot. Overlaps the
+/// inference thread's next forward.
 fn scatter_thread(shared: Arc<Shared>, work_rx: Receiver<WorkItem>, free_tx: SyncSender<usize>) {
     while let Ok(item) = work_rx.recv() {
         item.event.sync(); // wait the forward + output copy
         let m = item.m as i64;
-        let logits = Arc::new(bf16_to_vec_f32(&item.out_logits.narrow(0, 0, m)));
-        let values = bf16_to_vec_f32(&item.out_values.narrow(0, 0, m));
+        let logits = Arc::new(bf16_d2h(&item.out_logits.narrow(0, 0, m)));
+        let values = bf16_d2h(&item.out_values.narrow(0, 0, m));
         requeue_scattered(&shared, logits, &values, item.games);
         if free_tx.send(item.slot).is_err() {
             return;
@@ -641,6 +674,63 @@ pub fn run_bench(config: Config, run: Duration, interval: Duration) {
     }
     shutdown(&shared, pipeline);
     println!("DONE (read steady-state from the last few intervals)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    /// libtorch's own f32 -> bf16 cast, as raw bits.
+    fn torch_bf16_bits(xs: &[f32]) -> Vec<i16> {
+        let t = Tensor::from_slice(xs).to_kind(Kind::BFloat16).view_dtype(Kind::Int16);
+        let mut v = vec![0i16; xs.len()];
+        t.copy_data(&mut v, xs.len());
+        v
+    }
+
+    // Workers now narrow the encoding themselves; the net must see exactly the
+    // bits libtorch's cast produced before (round-to-nearest-even on both sides).
+    #[test]
+    fn worker_bf16_narrowing_matches_libtorch() {
+        // Every value encode_into can emit: 0/1 planes, walls/10, distance/20, 2.0.
+        let mut xs: Vec<f32> = vec![0.0, 1.0, 2.0];
+        xs.extend((0..=10).map(|k| k as f32 / 10.0));
+        xs.extend((0..=40).map(|d| d as f32 / 20.0));
+        let mut rng = StdRng::seed_from_u64(0);
+        xs.extend((0..10_000).map(|_| rng.gen_range(-4.0f32..4.0)));
+        let ours: Vec<i16> = xs.iter().map(|&x| bf16::from_f32(x).to_bits() as i16).collect();
+        assert_eq!(ours, torch_bf16_bits(&xs));
+    }
+
+    // ...and the real encoder agrees with libtorch on real positions.
+    #[test]
+    fn encode_bf16_bits_matches_libtorch_on_positions() {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut b = Board::new();
+        for _ in 0..200 {
+            if b.outcome().is_some() {
+                b = Board::new();
+            }
+            let f32s = b.encode();
+            assert_eq!(encode_bf16_bits(&b), torch_bf16_bits(&f32s));
+            let moves = b.legal_moves();
+            b.push(moves[rng.gen_range(0..moves.len())]);
+        }
+    }
+
+    // Widening bf16 -> f32 on the worker is exact (matches libtorch's upcast).
+    #[test]
+    fn worker_bf16_widening_matches_libtorch() {
+        let bits: Vec<i16> = (i16::MIN..=i16::MAX).step_by(7).collect();
+        let t = Tensor::from_slice(&bits).view_dtype(Kind::BFloat16).to_kind(Kind::Float);
+        let mut theirs = vec![0f32; bits.len()];
+        t.copy_data(&mut theirs, bits.len());
+        for (i, &b) in bits.iter().enumerate() {
+            let ours = bf16::from_bits(b as u16).to_f32();
+            assert!(ours.to_bits() == theirs[i].to_bits() || (ours.is_nan() && theirs[i].is_nan()));
+        }
+    }
 }
 
 // --- serve mode (production IPC) ---------------------------------------------

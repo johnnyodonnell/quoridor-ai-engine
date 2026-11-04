@@ -511,6 +511,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "crossbeam-channel",
+ "half",
  "quoridor_core",
  "rand",
  "tch",
