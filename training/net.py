@@ -19,6 +19,12 @@ POLICY_SIZE = 140
 N_BLOCKS = 6
 N_FILTERS = 64
 
+# GPU batch width the self-play serving_model.pt2 is exported at. The package is
+# compiled with a STATIC batch (no dynamic_shapes), so the Rust self-play worker
+# must use the same value: it is `BATCH` in selfplay_rs/src/pipeline.rs and is
+# enforced at worker startup by aoti_check_batch (shim.cpp). Keep the two in sync.
+SERVING_BATCH = 512
+
 
 class ResBlock(nn.Module):
     def __init__(self, filters):

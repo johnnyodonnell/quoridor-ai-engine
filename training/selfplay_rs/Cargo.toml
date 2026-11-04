@@ -16,6 +16,7 @@ path = "src/main.rs"
 quoridor_core = { path = "../quoridor_core" }
 tch = "0.23"
 rand = "0.8"
+crossbeam-channel = "0.5"
 
 [build-dependencies]
 cc = "1"

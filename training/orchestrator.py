@@ -63,9 +63,8 @@ def parse_args():
     # self-play
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--queue-max", type=int, default=256)
-    ap.add_argument("--bucket-size", type=int, default=512,
-                    help="GPU batch width per self-play forward. The .pt2 is "
-                         "compiled for exactly this batch.")
+    # The self-play GPU batch width is a fixed constant (net.SERVING_BATCH ==
+    # pipeline.rs BATCH): the .pt2 is compiled for exactly that batch.
     ap.add_argument("--n-threads", type=int, default=16,
                     help="Self-play MCTS worker threads.")
     # training
@@ -94,7 +93,8 @@ def main():
 
     import quoridor_rs
     from export import export_module
-    from net import BOARD_SIZE, INPUT_CHANNELS, N_BLOCKS, N_FILTERS, QuoridorNet, n_params
+    from net import (BOARD_SIZE, INPUT_CHANNELS, N_BLOCKS, N_FILTERS, SERVING_BATCH,
+                     QuoridorNet, n_params)
     from train import ReplayBuffer, train_step
 
     if not SELFPLAY_BIN.exists():
@@ -183,7 +183,7 @@ def main():
         ex = QuoridorNet(n_blocks=N_BLOCKS, n_filters=N_FILTERS).to(device).eval()
         ex.load_state_dict(net.state_dict())
         ex = ex.bfloat16()  # self-play runs the forward in bf16
-        x = torch.zeros(args.bucket_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE,
+        x = torch.zeros(SERVING_BATCH, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE,
                         device=device, dtype=torch.bfloat16)
         with torch.no_grad():
             ep = torch.export.export(ex, (x,))
@@ -292,7 +292,7 @@ def main():
     publish_safetensors()          # serving_weights.safetensors (worker swaps these in)
     t_export = time.time()
     _export_pt2(serving_pt2_path)  # the .pt2 forward graph, compiled ONCE (arch is fixed)
-    print(f"exported {serving_pt2_path.name} (batch={args.bucket_size}) "
+    print(f"exported {serving_pt2_path.name} (batch={SERVING_BATCH}) "
           f"in {time.time() - t_export:.0f}s", flush=True)
 
     out_queue = pyqueue.Queue(maxsize=args.queue_max)
@@ -345,7 +345,6 @@ def main():
              "--pt2", str(serving_pt2_path),
              "--weights-st", str(serving_st_path),
              "--threads", str(args.n_threads),
-             "--bucket", str(args.bucket_size),
              "--sims", str(args.sims),
              "--seed", str(args.seed + 1000 + total_games)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_worker_env(),
@@ -353,7 +352,7 @@ def main():
         t = threading.Thread(target=_reader_loop, args=(proc.stdout,), daemon=True)
         t.start()
         print(f"spawned selfplay_rs worker pid={proc.pid} (threads={args.n_threads} "
-              f"batch={args.bucket_size} sims={args.sims})", flush=True)
+              f"batch={SERVING_BATCH} sims={args.sims})", flush=True)
         return proc
 
     selfplay_proc = start_selfplay()

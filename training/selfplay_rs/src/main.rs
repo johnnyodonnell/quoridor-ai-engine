@@ -227,7 +227,6 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
     let config = Config {
         sims: flag(args, "--sims", "200").parse().unwrap(),
         add_root_noise: true,
-        bucket_size: flag(args, "--bucket", "512").parse().unwrap(),
         seed: flag(args, "--seed", "1234").parse().unwrap(),
         n_threads: flag(args, "--threads", "16").parse().unwrap(),
         n_slots: flag(args, "--slots", "8").parse().unwrap(),

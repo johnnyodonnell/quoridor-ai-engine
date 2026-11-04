@@ -22,11 +22,12 @@ import torch._inductor
 from safetensors.torch import save_file
 
 sys.path.insert(0, "..")
-from net import BOARD_SIZE, INPUT_CHANNELS, N_BLOCKS, N_FILTERS, QuoridorNet  # noqa: E402
+from net import (BOARD_SIZE, INPUT_CHANNELS, N_BLOCKS, N_FILTERS,  # noqa: E402
+                 SERVING_BATCH, QuoridorNet)
 
 CKPT = sys.argv[1] if len(sys.argv) > 1 else "../../../runs/run1/serving_weights.pt"
 OUT = sys.argv[2].rstrip("/") if len(sys.argv) > 2 else "."
-B = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+B = int(sys.argv[3]) if len(sys.argv) > 3 else SERVING_BATCH
 NOISE = float(sys.argv[4]) if len(sys.argv) > 4 else 0.02
 
 # Match the trainer: folded constants stay runtime-updatable.
