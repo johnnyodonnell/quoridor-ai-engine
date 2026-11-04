@@ -1,0 +1,26 @@
+[package]
+name = "selfplay_rs"
+version = "0.1.0"
+edition = "2021"
+description = "100% Rust self-play worker (AOTInductor forward via tch-rs) for quoridor-ai-engine"
+
+[lib]
+name = "selfplay_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "selfplay_rs"
+path = "src/main.rs"
+
+[dependencies]
+quoridor_core = { path = "../quoridor_core" }
+tch = "0.23"
+rand = "0.8"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
