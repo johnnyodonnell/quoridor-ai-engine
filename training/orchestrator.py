@@ -1,35 +1,40 @@
-"""Self-play training orchestrator (port of chess-ai-engine's orchestrator.py at
-commit 53b1b83).
+"""Self-play training orchestrator (port of chess-ai-engine's orchestrator.py).
 
-Runs the trainer in this (main) process and spawns ONE self-play process
-running the native quoridor_rs pipeline with the net on the GPU (selfplay.py).
-That process pushes finished games onto a bounded queue; the trainer drains it
-into a ring ReplayBuffer, runs SGD paced to the data rate, and republishes
-weights to serving_weights.pt, which the self-play side reloads in place.
+Runs the trainer in this process and spawns the standalone Rust self-play
+worker (selfplay_rs/target/release/selfplay_rs serve) as a subprocess. The
+worker streams finished games as length-prefixed frames on its stdout; a reader
+thread decodes them onto a bounded queue, and the trainer drains that into a
+ring ReplayBuffer and runs SGD paced to the data rate.
+
+The worker's forward is an AOTInductor package (serving_model.pt2) compiled
+ONCE at startup. Every --publish-every the trainer writes the raw weights to
+serving_weights.safetensors, which the worker swaps into the live model in
+place (no recompile). serving_weights.pt is still written for tooling.
 
 Every --snapshot-every it writes snapshots/<stem>.pt + .onnx and launches
 evaluate.py detached on the new snapshot (skipped if the previous eval is still
 running). latest.pt (weights + optimizer + clock + RNG) allows resuming.
-
-IMPORTANT: module-level imports are kept torch-free. `spawn` re-imports this
-module in the child, so importing torch here would load it twice for nothing.
-All torch imports live inside main().
 """
 
 import argparse
 import datetime
 import json
-import multiprocessing as mp
 import os
 import queue as pyqueue
+import struct
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
-from selfplay import run_selfplay_pipeline
+# The self-play worker is a standalone Rust binary, built by selfplay_rs/build.sh.
+SELFPLAY_BIN = Path(__file__).resolve().parent / "selfplay_rs" / "target" / "release" / "selfplay_rs"
+_STATE_LEN = 8 * 9 * 9
+_POLICY_LEN = 140
+_ROW_FLOATS = _STATE_LEN + _POLICY_LEN + 1  # state[648] + pi[140] + z
 
 
 def parse_duration(spec):
@@ -54,13 +59,13 @@ def parse_args():
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often the trainer republishes weights for the "
-                         "self-play process to reload.")
+                         "self-play worker to swap in.")
     # self-play
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--queue-max", type=int, default=256)
     ap.add_argument("--bucket-size", type=int, default=512,
-                    help="GPU batch width per self-play forward (in-flight games "
-                         "self-regulate to ~2x this).")
+                    help="GPU batch width per self-play forward. The .pt2 is "
+                         "compiled for exactly this batch.")
     ap.add_argument("--n-threads", type=int, default=16,
                     help="Self-play MCTS worker threads.")
     # training
@@ -85,13 +90,16 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # torch-heavy imports live here so the spawn-reimported child stays light.
     import torch
 
     import quoridor_rs
     from export import export_module
-    from net import N_BLOCKS, N_FILTERS, QuoridorNet, n_params
+    from net import BOARD_SIZE, INPUT_CHANNELS, N_BLOCKS, N_FILTERS, QuoridorNet, n_params
     from train import ReplayBuffer, train_step
+
+    if not SELFPLAY_BIN.exists():
+        raise SystemExit(f"self-play binary not found: {SELFPLAY_BIN} "
+                         f"(build it: selfplay_rs/build.sh)")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -159,9 +167,43 @@ def main():
         tmp.replace(path)
 
     serving_path = out_dir / "serving_weights.pt"
+    # The AOTInductor package (Inductor's fused kernels, no Python) defines the
+    # worker's forward graph and holds the initial weights. It is compiled ONCE
+    # (compiling takes several seconds of GPU); fresh weights are then pushed into
+    # the live runner's constant buffer via the safetensors sidecar below. Compiled
+    # with use_runtime_constant_folding=True so the runner re-derives folded
+    # constants (BN into conv etc.) from the pushed primaries.
+    serving_pt2_path = out_dir / "serving_model.pt2"
+    # Raw weights the worker swaps in every publish (bf16, keyed by state_dict FQN).
+    serving_st_path = out_dir / "serving_weights.safetensors"
+
+    def _export_pt2(path):
+        import torch._inductor  # noqa: F401  (registers aoti_compile_and_package)
+        torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
+        ex = QuoridorNet(n_blocks=N_BLOCKS, n_filters=N_FILTERS).to(device).eval()
+        ex.load_state_dict(net.state_dict())
+        ex = ex.bfloat16()  # self-play runs the forward in bf16
+        x = torch.zeros(args.bucket_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE,
+                        device=device, dtype=torch.bfloat16)
+        with torch.no_grad():
+            ep = torch.export.export(ex, (x,))
+            # aoti_compile_and_package requires the path to end in .pt2.
+            tmp = str(path.with_suffix("")) + ".tmp.pt2"
+            torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
+        os.replace(tmp, str(path))
 
     def publish_weights():
         _atomic_save(serving_path, {"weights": net.state_dict(), "config": config})
+
+    def publish_safetensors():
+        # The worker pushes these raw bf16 primaries into the AOTI constant buffer
+        # (mangling FQN '.'->'_'). Drop num_batches_tracked (not an AOTI constant).
+        from safetensors.torch import save_file
+        sd = {k: v.detach().to("cpu", torch.bfloat16).contiguous()
+              for k, v in net.state_dict().items() if "num_batches_tracked" not in k}
+        tmp = str(serving_st_path) + ".tmp"
+        save_file(sd, tmp)
+        os.replace(tmp, str(serving_st_path))
 
     def save_latest():
         _atomic_save(latest_path, {
@@ -245,21 +287,74 @@ def main():
 
     launch_eval.proc = None
 
-    # ----- Spawn the self-play process -----
-    publish_weights()
+    # ----- Spawn the standalone Rust self-play worker -----
+    publish_weights()              # serving_weights.pt (tooling / warm-start)
+    publish_safetensors()          # serving_weights.safetensors (worker swaps these in)
+    t_export = time.time()
+    _export_pt2(serving_pt2_path)  # the .pt2 forward graph, compiled ONCE (arch is fixed)
+    print(f"exported {serving_pt2_path.name} (batch={args.bucket_size}) "
+          f"in {time.time() - t_export:.0f}s", flush=True)
 
-    ctx = mp.get_context("spawn")
-    out_queue = ctx.Queue(maxsize=args.queue_max)
-    stop = ctx.Event()
+    out_queue = pyqueue.Queue(maxsize=args.queue_max)
+    stop = threading.Event()
+
+    def _read_exact(f, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = f.read(n - len(buf))
+            if not chunk:
+                return None  # EOF: worker exited
+            buf += chunk
+        return bytes(buf)
+
+    def _reader_loop(stdout):
+        # Decode length-prefixed game frames from the worker into
+        # (rows, 1, n_rows) on out_queue.
+        while True:
+            hdr = _read_exact(stdout, 4)
+            if hdr is None:
+                return
+            (n_rows,) = struct.unpack("<I", hdr)
+            payload = _read_exact(stdout, n_rows * _ROW_FLOATS * 4)
+            if payload is None:
+                return
+            flat = np.frombuffer(payload, dtype="<f4").reshape(n_rows, _ROW_FLOATS)
+            rows = [(r[:_STATE_LEN].copy(), r[_STATE_LEN:_STATE_LEN + _POLICY_LEN].copy(),
+                     float(r[-1])) for r in flat]
+            while not stop.is_set():
+                try:
+                    out_queue.put((rows, 1, n_rows), timeout=0.5)
+                    break
+                except pyqueue.Full:
+                    pass
+
+    def _worker_env():
+        # The binary links libtorch from the venv; put torch's and the pip CUDA
+        # wheels' lib dirs on the loader path.
+        import glob
+        torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        sp = os.path.dirname(os.path.dirname(torch.__file__))  # site-packages
+        libs = [torch_lib] + sorted(glob.glob(os.path.join(sp, "nvidia", "*", "lib")))
+        env = dict(os.environ)
+        env["LD_LIBRARY_PATH"] = ":".join(libs) + ":" + env.get("LD_LIBRARY_PATH", "")
+        return env
 
     def start_selfplay():
-        p = ctx.Process(
-            target=run_selfplay_pipeline,
-            args=(out_queue, stop, args.seed + 1000 + total_games, args.sims,
-                  str(serving_path), args.n_threads, args.bucket_size, str(device)),
+        proc = subprocess.Popen(
+            [str(SELFPLAY_BIN), "serve",
+             "--pt2", str(serving_pt2_path),
+             "--weights-st", str(serving_st_path),
+             "--threads", str(args.n_threads),
+             "--bucket", str(args.bucket_size),
+             "--sims", str(args.sims),
+             "--seed", str(args.seed + 1000 + total_games)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_worker_env(),
         )
-        p.start()
-        return p
+        t = threading.Thread(target=_reader_loop, args=(proc.stdout,), daemon=True)
+        t.start()
+        print(f"spawned selfplay_rs worker pid={proc.pid} (threads={args.n_threads} "
+              f"batch={args.bucket_size} sims={args.sims})", flush=True)
+        return proc
 
     selfplay_proc = start_selfplay()
 
@@ -296,8 +391,9 @@ def main():
     net.train()
     try:
         while True:
-            if not selfplay_proc.is_alive():
-                print("warn: self-play process died; restarting", flush=True)
+            if selfplay_proc.poll() is not None:
+                print(f"warn: self-play worker exited (code {selfplay_proc.returncode}); "
+                      f"restarting", flush=True)
                 selfplay_proc = start_selfplay()
 
             if elapsed() >= next_snapshot_at:
@@ -345,6 +441,7 @@ def main():
             now = time.time()
             if now - last_publish >= publish_interval:
                 publish_weights()
+                publish_safetensors()  # the worker swaps these into the live AOTI model
                 last_publish = now
             if now - last_latest_save >= save_latest_interval:
                 save_latest()
@@ -366,9 +463,11 @@ def main():
     finally:
         print("shutting down: signaling self-play", flush=True)
         stop.set()
-        selfplay_proc.join(timeout=10)
-        if selfplay_proc.is_alive():
-            selfplay_proc.terminate()
+        selfplay_proc.terminate()  # SIGTERM the Rust worker
+        try:
+            selfplay_proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            selfplay_proc.kill()
 
 
 if __name__ == "__main__":

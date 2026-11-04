@@ -1,8 +1,8 @@
-//! Python bindings for the Quoridor core: a `Board` for tests and tooling, the
-//! self-play `PipelineEngine` and the evaluation `MatchEngine`.
+//! Python bindings for the Quoridor core: a `Board` for tests and tooling, and
+//! the evaluation `MatchEngine`. Self-play runs in the standalone selfplay_rs
+//! binary.
 
 mod matches;
-mod pipeline;
 
 use numpy::ndarray::Array3;
 use numpy::{IntoPyArray, PyArray3};
@@ -97,7 +97,6 @@ fn mirror_policy_perm() -> Vec<usize> {
 #[pymodule]
 fn quoridor_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBoard>()?;
-    m.add_class::<pipeline::PipelineEngine>()?;
     m.add_class::<matches::MatchEngine>()?;
     m.add_function(wrap_pyfunction!(mirror_state_perm, m)?)?;
     m.add_function(wrap_pyfunction!(mirror_policy_perm, m)?)?;

@@ -2,6 +2,7 @@
 //! chess-ai-engine's training/selfplay_rs).
 //!
 //! Subcommands:
+//!   serve                 production: stream finished games to stdout (orchestrator.py)
 //!   bench                 run the self-play pipeline, print games/sec
 //!   forward-check <dir>   parity gate: Rust tch net vs PyTorch fixture
 //!   aoti-parity           parity gate: AOTI .pt2 vs torch.compile on the fixture
@@ -352,6 +353,11 @@ fn main() {
             let (config, run, interval) = bench_config(&args);
             pipeline::run_bench(config, run, interval);
         }
+        "serve" => {
+            assert!(tch::Cuda::is_available(), "CUDA not available to tch");
+            let (config, _, _) = bench_config(&args);
+            pipeline::run_serve(config);
+        }
         "time-forward" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let weights = flag(&args, "--weights", "weights.safetensors");
@@ -380,7 +386,7 @@ fn main() {
             std::process::exit(if aoti_swap_parity(&pt2_w1, &pt2_w2, &weights_w2, b) { 0 } else { 1 });
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: bench | forward-check | aoti-parity | aoti-swap-parity | aoti-time | time-forward");
+            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-parity | aoti-swap-parity | aoti-time | time-forward");
             std::process::exit(2);
         }
     }

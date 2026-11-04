@@ -4,9 +4,14 @@
 #   pm2 start repo/training/run_daemon.sh --name quoridor-train --kill-timeout 20000 \
 #     --output logs/train.out.log --error logs/train.err.log
 #
-# The orchestrator runs the trainer in this process and spawns one self-play
-# process (quoridor_rs pipeline + compiled bf16 forward). Every snapshot it
-# launches evaluate.py detached. Resumes $OUT_DIR/latest.pt if present.
+# The orchestrator runs the trainer in this process and spawns the standalone
+# Rust self-play worker (selfplay_rs serve: MCTS workers + AOTInductor bf16
+# forward). Every snapshot it launches evaluate.py detached. Resumes
+# $OUT_DIR/latest.pt if present.
+#
+# Build both native pieces first (after every pull that touches them):
+#   repo/training/quoridor_rs/build.sh   (pyo3 extension: Board, MatchEngine)
+#   repo/training/selfplay_rs/build.sh   (self-play binary)
 #
 # Every file the run writes — checkpoints, compile caches, temp files — stays
 # under $ROOT.
