@@ -37,21 +37,41 @@ body {
   padding: 2rem;
 }
 
-h1 {
-  font-size: 1.75rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
 .status {
   font-size: 1.1rem;
-  color: var(--muted);
+  color: var(--text);
+  font-weight: 600;
   min-height: 1.5rem;
 }
 
+.play {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: stretch;
+  gap: 1.5rem;
+}
+
+/* Bot's count sits level with the bot's edge (top), the human's with theirs. */
+.side {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-width: 8rem;
+  gap: 1rem;
+}
+
 .walls-left {
-  font-size: 0.95rem;
-  color: var(--muted);
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.walls-left.p0 {
+  color: var(--p0);
+}
+
+.walls-left.p1 {
+  color: var(--p1);
 }
 
 .board {
