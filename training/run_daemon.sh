@@ -35,7 +35,7 @@ fi
 cd "$REPO_DIR/training"
 exec "$VENV/bin/python" orchestrator.py \
   --out-dir "$OUT_DIR" \
-  --snapshot-every "${SNAPSHOT_EVERY:-30m}" \
+  --snapshot-every "${SNAPSHOT_EVERY:-1h}" \
   --save-latest-every 300s \
   --sims "${SIMS:-200}" \
   --n-threads "${N_THREADS:-16}" \
