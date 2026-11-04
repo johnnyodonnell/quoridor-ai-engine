@@ -20,9 +20,14 @@
 //!
 //! With N slots, up to N forwards are queued on the GPU back-to-back, so the
 //! readback/requeue of one batch overlaps the next batch's forward.
+//!
+//! Weight hot-reload: the inference thread mtime-polls the safetensors sidecar
+//! the trainer publishes and swaps the raw weights into the live AOTI constant
+//! buffer (no recompile).
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -150,8 +155,10 @@ pub struct Config {
     pub bucket_size: usize,
     pub seed: u64,
     pub n_threads: usize,
-    pub n_slots: usize,     // in-flight forwards / pinned input slots
-    pub model_path: String, // serving_model.pt2 (AOTInductor graph, loaded once)
+    pub n_slots: usize,       // in-flight forwards / pinned input slots
+    pub model_path: String,   // serving_model.pt2 (AOTInductor graph, loaded once)
+    pub weights_path: String, // serving_weights.safetensors (raw weights swapped in)
+    pub reload_every: Duration,
 }
 
 struct Shared {
@@ -383,18 +390,61 @@ struct Infer {
     model: AotiModel,
     dev: Device,
     pinned_in: Vec<Tensor>, // N pinned host bf16 [B,8,9,9]
+    weights_path: String,
+    reload_every: Duration,
+    last_check: Instant,
+    last_mtime: Option<std::time::SystemTime>,
 }
 
 impl Infer {
     fn new(config: &Config, n_slots: usize) -> Infer {
         let dev = Device::Cuda(0);
         let b = config.bucket_size as i64;
-        // The .pt2 defines the forward graph + weights and is loaded ONCE.
+        // The .pt2 defines the forward graph + initial weights and is loaded ONCE;
+        // fresh weights arrive via the safetensors sidecar (maybe_reload).
         let model = AotiModel::load(&config.model_path);
         let pinned_in = (0..n_slots)
             .map(|_| Tensor::zeros([b, C, S, S], (Kind::BFloat16, Device::Cpu)).pin_memory(dev))
             .collect();
-        Infer { model, dev, pinned_in }
+        Infer {
+            model,
+            dev,
+            pinned_in,
+            // None (file absent at startup) still reloads once the file appears.
+            last_mtime: std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok(),
+            weights_path: config.weights_path.clone(),
+            reload_every: config.reload_every,
+            last_check: Instant::now(),
+        }
+    }
+
+    fn maybe_reload(&mut self) {
+        if self.last_check.elapsed() < self.reload_every {
+            return;
+        }
+        self.last_check = Instant::now();
+        let m = std::fs::metadata(&self.weights_path).and_then(|md| md.modified()).ok();
+        if m.is_none() || m == self.last_mtime {
+            return;
+        }
+        // Trainer published fresh weights: read the safetensors sidecar, move the raw
+        // primaries to CUDA bf16, and push them into the live AOTI constant buffer
+        // (update_constant_buffer -> run_const_fold -> swap). The trainer writes the
+        // file atomically (rename), so a changed mtime means a complete file.
+        let entries = match Tensor::read_safetensors(&self.weights_path) {
+            Ok(v) => v,
+            Err(_) => return, // transient; retry on the next tick
+        };
+        let mut names: Vec<CString> = Vec::with_capacity(entries.len());
+        let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
+        for (name, t) in entries {
+            // AOTI keys constants by the mangled FQN ('.'->'_').
+            names.push(CString::new(name.replace('.', "_")).unwrap());
+            tensors.push(t.to_device(self.dev).to_kind(Kind::BFloat16));
+        }
+        let refs: Vec<&Tensor> = tensors.iter().collect();
+        self.model.swap_weights(&names, &refs);
+        self.last_mtime = m;
     }
 
     /// Fill pinned slot `slot` with `m` rows, async-H2D, launch the forward, and
@@ -437,6 +487,7 @@ fn inference_thread(shared: Arc<Shared>, work_tx: SyncSender<WorkItem>, free_rx:
                 return;
             }
         };
+        infer.maybe_reload();
         let slot = match free_rx.recv() {
             Ok(s) => s,
             Err(_) => return, // scatter gone
