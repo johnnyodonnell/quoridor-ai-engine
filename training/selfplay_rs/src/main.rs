@@ -2,6 +2,7 @@
 //! chess-ai-engine's training/selfplay_rs).
 //!
 //! Subcommands:
+//!   bench                 run the self-play pipeline, print games/sec
 //!   forward-check <dir>   parity gate: Rust tch net vs PyTorch fixture
 //!   aoti-parity           parity gate: AOTI .pt2 vs torch.compile on the fixture
 //!   aoti-time             AOTI forward timing (direct vs CUDA-graph replay)
@@ -9,12 +10,15 @@
 
 mod aoti;
 mod cudagraph;
+mod pipeline;
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use quoridor_core::board::{INPUT_CHANNELS, POLICY_SIZE, SIZE};
 use tch::{Device, Kind, Tensor};
 
+use pipeline::Config;
 use selfplay_rs::net::Net;
 
 const C: i64 = INPUT_CHANNELS as i64;
@@ -195,6 +199,40 @@ fn aoti_time(pt2: &str, weights: &str, b: i64) {
     cudagraph::device_synchronize();
     let us = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
     println!("AOTI forward (direct, incl. output copy): {us:.0} us/fwd at B={b}");
+
+    // Wrap the AOTI run (+ output copy) in a CUDA graph and replay it as one
+    // launch, to measure what per-kernel launch overhead costs the direct call.
+    // Capture needs the single-threaded loader (see aoti_load in shim.cpp).
+    cudagraph::set_side_stream();
+    for _ in 0..5 {
+        model.run(&x, &out_logits, &out_values);
+    }
+    cudagraph::device_synchronize();
+    let g = cudagraph::CudaGraph::capture(|| model.run(&x, &out_logits, &out_values));
+    cudagraph::device_synchronize();
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        g.replay();
+    }
+    cudagraph::device_synchronize();
+    let gus = t.elapsed().as_secs_f64() / iters as f64 * 1e6;
+    println!("AOTI forward (CUDA-graph replay):  {gus:.0} us/fwd at B={b}  ({:.1}% vs direct)",
+             (gus - us) / us * 100.0);
+}
+
+fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
+    let config = Config {
+        sims: flag(args, "--sims", "200").parse().unwrap(),
+        add_root_noise: true,
+        bucket_size: flag(args, "--bucket", "512").parse().unwrap(),
+        seed: flag(args, "--seed", "1234").parse().unwrap(),
+        n_threads: flag(args, "--threads", "16").parse().unwrap(),
+        n_slots: flag(args, "--slots", "8").parse().unwrap(),
+        model_path: flag(args, "--pt2", "serving_model.pt2"),
+    };
+    let run = Duration::from_secs_f64(flag(args, "--run", "420").parse().unwrap());
+    let interval = Duration::from_secs_f64(flag(args, "--interval", "30").parse().unwrap());
+    (config, run, interval)
 }
 
 /// AOTI parity on real positions: run the .pt2 on the fixture and compare the
@@ -245,6 +283,11 @@ fn main() {
             println!("{}", if ok { "FORWARD-CHECK OK" } else { "FORWARD-CHECK FAILED" });
             std::process::exit(if ok { 0 } else { 1 });
         }
+        "bench" => {
+            assert!(tch::Cuda::is_available(), "CUDA not available to tch");
+            let (config, run, interval) = bench_config(&args);
+            pipeline::run_bench(config, run, interval);
+        }
         "time-forward" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let weights = flag(&args, "--weights", "weights.safetensors");
@@ -265,7 +308,7 @@ fn main() {
             std::process::exit(if aoti_parity(&dir, &pt2) { 0 } else { 1 });
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: forward-check | aoti-parity | aoti-time | time-forward");
+            eprintln!("unknown subcommand {other:?}; expected: bench | forward-check | aoti-parity | aoti-time | time-forward");
             std::process::exit(2);
         }
     }

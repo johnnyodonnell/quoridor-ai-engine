@@ -14,13 +14,37 @@
 
 extern "C" {
 
+// --- CUDA events: gate the scatter thread's readback on the forward's
+// completion so it overlaps the inference thread's next forward. Recorded on the
+// thread's current CUDA stream.
+void* cg_event_new() {
+    cudaEvent_t e;
+    cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
+    return reinterpret_cast<void*>(e);
+}
+void cg_event_record(void* e) {
+    cudaEventRecord(reinterpret_cast<cudaEvent_t>(e),
+                    c10::cuda::getCurrentCUDAStream().stream());
+}
+void cg_event_sync(void* e) {
+    cudaEventSynchronize(reinterpret_cast<cudaEvent_t>(e));
+}
+void cg_event_free(void* e) {
+    cudaEventDestroy(reinterpret_cast<cudaEvent_t>(e));
+}
+
 // --- AOTInductor package loader (the fused, Python-free forward) -------------
 // tch tensor handles (C_tensor*) ARE at::Tensor* under the hood, so we
 // reinterpret them directly. Outputs are copy_'d into Rust-owned tensors so all
 // lifetime stays on the tch side.
 void* aoti_load(const char* path) {
-    return reinterpret_cast<void*>(
-        new torch::inductor::AOTIModelPackageLoader(std::string(path), "model"));
+    // run_single_threaded=true runs the model inline on the calling thread instead
+    // of via AOTI's thread pool. The pooled path issues an op that's illegal during
+    // CUDA-graph capture ("operation not permitted when stream is capturing", pytorch
+    // #158834); the single-threaded path is capture-safe, letting us graph the AOTI
+    // forward (and it has no downside for our single-stream inference).
+    return reinterpret_cast<void*>(new torch::inductor::AOTIModelPackageLoader(
+        std::string(path), "model", /*run_single_threaded=*/true));
 }
 
 void aoti_run(void* loader_, const void* in_, void* out_logits_, void* out_values_) {
