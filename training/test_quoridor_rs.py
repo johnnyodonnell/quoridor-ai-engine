@@ -59,27 +59,3 @@ def test_replay_mirror_matches_mirrored_board():
     states, pis, zs = buf.sample(64, rng)
     assert states.shape == (64, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
     assert pis.shape == (64, POLICY_SIZE) and np.all(zs == 0.5)
-
-
-def test_match_engine_random_vs_random():
-    eng = quoridor_rs.MatchEngine(6, 8, 4, 0, True, True)
-    enc, who = eng.leaves()
-    assert len(who) == 0  # random players never need the net
-    assert all(r in (-1, 0, 1) for r in eng.results())
-
-
-def test_match_engine_net_vs_random_runs_to_completion():
-    # Drive a net player (uniform prior, zero value) against random: only the
-    # net's rows come back, and every game finishes.
-    eng = quoridor_rs.MatchEngine(8, 16, 4, 1, False, True)
-    rounds = 0
-    while True:
-        enc, who = eng.leaves()
-        if len(who) == 0:
-            break
-        assert np.all(who == 0)
-        assert enc.shape == (len(who), INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-        eng.apply(np.zeros((len(who), POLICY_SIZE), np.float32), np.zeros(len(who), np.float32))
-        rounds += 1
-    assert rounds > 0
-    assert all(r in (-1, 0, 1) for r in eng.results())

@@ -12,7 +12,6 @@ crate-type = ["cdylib"]
 quoridor_core = { path = "../quoridor_core" }
 pyo3 = { version = "0.24", features = ["extension-module"] }
 numpy = "0.24"
-rand = "0.8"
 
 [profile.release]
 opt-level = 3

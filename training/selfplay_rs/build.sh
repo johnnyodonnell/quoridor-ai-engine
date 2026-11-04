@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build the selfplay_rs binaries (release) against the project venv's PyTorch
-# libtorch. Run on the aarch64 training box; output lands in
-# selfplay_rs/target/release/, where orchestrator.py looks for it.
+# Build the selfplay_rs binaries (release: selfplay_rs + evaluate_rs) against the
+# project venv's PyTorch libtorch. Run on the aarch64 training box; output lands
+# in selfplay_rs/target/release/, where orchestrator.py looks for it.
 #   ./build.sh
 # Everything (cargo registry, temp files) stays under the project root.
 set -euo pipefail
@@ -20,4 +20,4 @@ mkdir -p "$TMPDIR"
 
 cd "$HERE"
 cargo build --release
-echo "built $HERE/target/release/selfplay_rs"
+echo "built $HERE/target/release/{selfplay_rs,evaluate_rs}"

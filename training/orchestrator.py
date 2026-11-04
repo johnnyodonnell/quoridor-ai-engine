@@ -11,9 +11,10 @@ ONCE at startup. Every --publish-every the trainer writes the raw weights to
 serving_weights.safetensors, which the worker swaps into the live model in
 place (no recompile). serving_weights.pt is still written for tooling.
 
-Every --snapshot-every it writes snapshots/<stem>.pt + .onnx and launches
-evaluate.py detached on the new snapshot (skipped if the previous eval is still
-running). latest.pt (weights + optimizer + clock + RNG) allows resuming.
+Every --snapshot-every it writes snapshots/<stem>.safetensors (fp32) + .onnx
+and launches the Rust evaluator (evaluate_rs) detached on the new snapshot
+(skipped if the previous eval is still running). latest.pt (weights + optimizer
++ clock + RNG) allows resuming.
 """
 
 import argparse
@@ -23,15 +24,16 @@ import os
 import queue as pyqueue
 import struct
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
 
-# The self-play worker is a standalone Rust binary, built by selfplay_rs/build.sh.
+# Self-play and evaluation are standalone Rust binaries from the same crate,
+# built by selfplay_rs/build.sh.
 SELFPLAY_BIN = Path(__file__).resolve().parent / "selfplay_rs" / "target" / "release" / "selfplay_rs"
+EVAL_BIN = Path(__file__).resolve().parent / "selfplay_rs" / "target" / "release" / "evaluate_rs"
 _STATE_LEN = 8 * 9 * 9
 _POLICY_LEN = 140
 _ROW_FLOATS = _STATE_LEN + _POLICY_LEN + 1  # state[648] + pi[140] + z
@@ -82,7 +84,7 @@ def parse_args():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--log-every", type=float, default=30.0)
     ap.add_argument("--eval-args", default="",
-                    help="Extra arguments passed through to evaluate.py.")
+                    help="Extra arguments passed through to evaluate_rs.")
     return ap.parse_args()
 
 
@@ -97,9 +99,9 @@ def main():
                      QuoridorNet, n_params)
     from train import ReplayBuffer, train_step
 
-    if not SELFPLAY_BIN.exists():
-        raise SystemExit(f"self-play binary not found: {SELFPLAY_BIN} "
-                         f"(build it: selfplay_rs/build.sh)")
+    for binary in (SELFPLAY_BIN, EVAL_BIN):
+        if not binary.exists():
+            raise SystemExit(f"binary not found: {binary} (build it: selfplay_rs/build.sh)")
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -219,22 +221,28 @@ def main():
             "config": config,
         })
 
+    def _save_snapshot_st(path):
+        # Snapshot weights as fp32 safetensors (the Rust evaluator reads these;
+        # no pickled .pt). Drop num_batches_tracked (not a model parameter).
+        from safetensors.torch import save_file
+        sd = {k: v.detach().to("cpu", torch.float32).contiguous()
+              for k, v in net.state_dict().items() if "num_batches_tracked" not in k}
+        tmp = str(path) + ".tmp"
+        save_file(sd, tmp)
+        os.replace(tmp, str(path))
+
     def save_snapshot():
         snap_dir = out_dir / "snapshots"
         snap_dir.mkdir(exist_ok=True)
         minutes = int(elapsed() / 60)
         utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%MZ")
         stem = f"snap_m{minutes:06d}_{utc}"
-        pt_path = snap_dir / f"{stem}.pt"
-        _atomic_save(pt_path, {
-            "weights": net.state_dict(),
-            "config": config,
-            "stats": {"elapsed_sec": elapsed(), "games": total_games,
-                      "train_steps": total_train_steps, "buffer_size": len(buf)},
-        })
+        st_path = snap_dir / f"{stem}.safetensors"
+        _save_snapshot_st(st_path)
         export_module(net, str(snap_dir / f"{stem}.onnx"))
-        print(f"[snapshot] {stem}", flush=True)
-        return pt_path
+        print(f"[snapshot] {stem} (games={total_games} train_steps={total_train_steps})",
+              flush=True)
+        return st_path
 
     def _pid_alive(pid):
         try:
@@ -254,7 +262,9 @@ def main():
             pass
         return True
 
-    def launch_eval(pt_path):
+    def launch_eval(st_path):
+        # Reap the previous eval if it has finished, so it doesn't linger as a
+        # zombie and trip the staleness check below.
         prev = launch_eval.proc
         if prev is not None and prev.poll() is not None:
             launch_eval.proc = None
@@ -264,7 +274,7 @@ def main():
                 prev_pid = int(lock.read_text().split()[0])
                 if _pid_alive(prev_pid):
                     print(f"[eval] prior eval (pid {prev_pid}) still running; "
-                          f"skipping {pt_path.name}", flush=True)
+                          f"skipping {st_path.name}", flush=True)
                     return
             except (ValueError, IndexError, OSError):
                 pass
@@ -272,17 +282,18 @@ def main():
         logf = open(out_dir / "eval.log", "a")
         try:
             proc = subprocess.Popen(
-                [sys.executable, "evaluate.py",
-                 "--run-dir", str(out_dir), "--candidate", str(pt_path),
+                [str(EVAL_BIN),
+                 "--run-dir", str(out_dir), "--candidate", str(st_path),
                  *args.eval_args.split()],
                 cwd=str(training_dir), stdout=logf, stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=_worker_env(),  # libtorch/CUDA on LD_LIBRARY_PATH, as for self-play
             )
         finally:
             logf.close()
         launch_eval.proc = proc
         lock.write_text(f"{proc.pid} {time.time()}")
-        print(f"[eval] launched evaluate.py pid={proc.pid} for {pt_path.name}",
+        print(f"[eval] launched evaluate_rs pid={proc.pid} for {st_path.name}",
               flush=True)
 
     launch_eval.proc = None
@@ -396,11 +407,11 @@ def main():
                 selfplay_proc = start_selfplay()
 
             if elapsed() >= next_snapshot_at:
-                pt_path = save_snapshot()
+                st_path = save_snapshot()
                 save_latest()
                 last_latest_save = time.time()
                 next_snapshot_at += snapshot_interval
-                launch_eval(pt_path)
+                launch_eval(st_path)
                 continue
 
             got_any = False

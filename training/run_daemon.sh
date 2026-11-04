@@ -6,12 +6,13 @@
 #
 # The orchestrator runs the trainer in this process and spawns the standalone
 # Rust self-play worker (selfplay_rs serve: MCTS workers + AOTInductor bf16
-# forward). Every snapshot it launches evaluate.py detached. Resumes
+# forward). Every snapshot it launches the Rust evaluator (evaluate_rs) detached
+# (EVAL_ARGS are passed through to it). Resumes
 # $OUT_DIR/latest.pt if present.
 #
 # Build both native pieces first (after every pull that touches them):
-#   repo/training/quoridor_rs/build.sh   (pyo3 extension: Board, MatchEngine)
-#   repo/training/selfplay_rs/build.sh   (self-play binary)
+#   repo/training/quoridor_rs/build.sh   (pyo3 extension: Board, used by the trainer)
+#   repo/training/selfplay_rs/build.sh   (selfplay_rs + evaluate_rs binaries)
 #
 # Every file the run writes — checkpoints, compile caches, temp files — stays
 # under $ROOT.
