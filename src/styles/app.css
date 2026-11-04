@@ -4,6 +4,14 @@
   --line: #d4d4d8;
   --text: #18181b;
   --muted: #71717a;
+  --board: #a1a1aa;
+  --target: #bfdbfe;
+  --last: #fde68a;
+  --last-stroke: #f59e0b;
+  --p0: #2563eb;
+  --p0-wall: #1e3a8a;
+  --p1: #dc2626;
+  --p1-wall: #7f1d1d;
 }
 
 * {
@@ -41,6 +49,66 @@ h1 {
   min-height: 1.5rem;
 }
 
+.walls-left {
+  font-size: 0.95rem;
+  color: var(--muted);
+}
+
+.board {
+  width: 528px;
+  max-width: 90vw;
+  background: var(--board);
+  border-radius: 8px;
+  touch-action: manipulation;
+}
+
+.board.interactive {
+  cursor: pointer;
+}
+
+.square {
+  fill: var(--surface);
+}
+
+.square.target {
+  fill: var(--target);
+}
+
+.square.last {
+  fill: var(--last);
+}
+
+.wall.p0 {
+  fill: var(--p0-wall);
+}
+
+.wall.p1 {
+  fill: var(--p1-wall);
+}
+
+.wall.last {
+  fill: var(--p1);
+  stroke: var(--last-stroke);
+  stroke-width: 2;
+}
+
+.wall.ghost {
+  fill: var(--p0);
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.pawn {
+  pointer-events: none;
+}
+
+.pawn.p0 {
+  fill: var(--p0);
+}
+
+.pawn.p1 {
+  fill: var(--p1);
+}
 
 .new-game {
   font-size: 1rem;

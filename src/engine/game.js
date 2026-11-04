@@ -9,7 +9,8 @@
 //   'h' lies between rows r and r+1, covering columns c and c+1.
 //   'v' lies between columns c and c+1, covering rows r and r+1.
 // Walls may not overlap, may not cross at their midpoint, and may not cut
-// either pawn off from its goal row.
+// either pawn off from its goal row. Placed walls live in a Map from key
+// (e.g. 'h3,4') to the player who placed it.
 //
 // A move is { type: 'pawn', r, c } or { type: 'wall', r, c, o }.
 
@@ -34,7 +35,7 @@ export function createGame() {
       { r: 0, c: 4 },
       { r: SIZE - 1, c: 4 },
     ],
-    walls: new Set(),
+    walls: new Map(),
     wallsLeft: [WALLS_PER_PLAYER, WALLS_PER_PLAYER],
     turn: HUMAN,
     winner: null,
@@ -112,7 +113,7 @@ export function isLegalWall(state, { r, c, o }) {
       ? [wallKey('h', r, c), wallKey('h', r, c - 1), wallKey('h', r, c + 1), wallKey('v', r, c)]
       : [wallKey('v', r, c), wallKey('v', r - 1, c), wallKey('v', r + 1, c), wallKey('h', r, c)]
   if (conflicts.some((k) => walls.has(k))) return false
-  const next = new Set(walls).add(wallKey(o, r, c))
+  const next = new Map(walls).set(wallKey(o, r, c), state.turn)
   return state.pawns.every((p, i) => hasPath(next, p, GOAL_ROW[i]))
 }
 
@@ -142,9 +143,17 @@ export function applyMove(state, move) {
   }
 
   if (!isLegalWall(state, move)) return null
-  next.walls = new Set(state.walls).add(wallKey(move.o, move.r, move.c))
+  next.walls = new Map(state.walls).set(wallKey(move.o, move.r, move.c), player)
   next.wallsLeft = state.wallsLeft.map((n, i) => (i === player ? n - 1 : n))
   return next
+}
+
+// Placed walls as [{ r, c, o, player }], for rendering.
+export function wallList(state) {
+  return [...state.walls].map(([key, player]) => {
+    const [r, c] = key.slice(1).split(',').map(Number)
+    return { r, c, o: key[0], player }
+  })
 }
 
 export function getTurn(state) {
