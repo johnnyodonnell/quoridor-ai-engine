@@ -57,7 +57,7 @@ def parse_args():
     ap.add_argument("--init-from", default=None,
                     help="Warm-start a fresh run from this checkpoint (weights "
                          "[+optimizer], fresh clock). Only on cold start.")
-    ap.add_argument("--snapshot-every", default="1h")
+    ap.add_argument("--snapshot-every", default="4h")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
                     help="How often the trainer republishes weights for the "
