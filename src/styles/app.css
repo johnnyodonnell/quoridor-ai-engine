@@ -44,21 +44,47 @@ body {
   min-height: 1.5rem;
 }
 
+/* The side panel hangs off the board's right edge (absolutely positioned) so
+   the board itself stays centered in the window. */
 .play {
+  position: relative;
   display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  align-items: stretch;
-  gap: 1.5rem;
 }
 
 /* Bot's count sits level with the bot's edge (top), the human's with theirs. */
 .side {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(100% + 1.5rem);
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  min-width: 8rem;
-  gap: 1rem;
+  width: 8rem;
+}
+
+/* Too narrow for a panel beside the board: put it underneath instead. */
+@media (max-width: 900px) {
+  .app {
+    padding: 2rem 1rem;
+  }
+
+  .board {
+    max-width: calc(100vw - 2rem);
+  }
+
+  .play {
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .side {
+    position: static;
+    width: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 1rem;
+  }
 }
 
 .walls-left {
