@@ -46,5 +46,6 @@ exec "$VENV/bin/python" orchestrator.py \
   --pt2-every "${PT2_EVERY:-120s}" \
   --sims "${SIMS:-200}" \
   --n-threads "${N_THREADS:-24}" \
+  --n-slots "${SLOTS:-2}" \
   --eval-args "${EVAL_ARGS:-}" \
   "${INIT_ARGS[@]}"

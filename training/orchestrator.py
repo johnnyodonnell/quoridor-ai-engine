@@ -74,6 +74,11 @@ def parse_args():
     ap.add_argument("--queue-max", type=int, default=256)
     # The self-play GPU batch width is a fixed constant (net.SERVING_BATCH ==
     # pipeline.rs BATCH): the .pt2 is compiled for exactly that batch.
+    ap.add_argument("--n-slots", type=int, default=2,
+                    help="Self-play GPU batches in flight. Each slot adds ~3*batch "
+                         "games (each with a search tree) to the in-flight pool: "
+                         "2 slots ~ 20 GB RAM at batch 1024 vs ~80 GB at 8, with "
+                         "the same throughput and ~4x fresher games.")
     ap.add_argument("--n-threads", type=int, default=24,
                     help="Self-play MCTS worker threads.")
     # training
@@ -348,6 +353,7 @@ def main():
             [str(SELFPLAY_BIN), "serve",
              "--pt2", str(serving_pt2_path),
              "--threads", str(args.n_threads),
+             "--slots", str(args.n_slots),
              "--sims", str(args.sims),
              "--seed", str(args.seed + 1000 + total_games)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=_worker_env(),
@@ -355,7 +361,7 @@ def main():
         t = threading.Thread(target=_reader_loop, args=(proc.stdout,), daemon=True)
         t.start()
         print(f"spawned selfplay_rs worker pid={proc.pid} (threads={args.n_threads} "
-              f"batch={SERVING_BATCH} sims={args.sims})", flush=True)
+              f"slots={args.n_slots} batch={SERVING_BATCH} sims={args.sims})", flush=True)
         return proc
 
     selfplay_proc = start_selfplay()

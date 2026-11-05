@@ -228,7 +228,7 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
         add_root_noise: true,
         seed: flag(args, "--seed", "1234").parse().unwrap(),
         n_threads: flag(args, "--threads", "24").parse().unwrap(),
-        n_slots: flag(args, "--slots", "8").parse().unwrap(),
+        n_slots: flag(args, "--slots", "2").parse().unwrap(),
         model_path: flag(args, "--pt2", "serving_model.pt2"),
         reload_every: Duration::from_secs_f64(flag(args, "--reload-every", "15.0").parse().unwrap()),
     };
