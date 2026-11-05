@@ -228,7 +228,7 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
         sims: flag(args, "--sims", "200").parse().unwrap(),
         add_root_noise: true,
         seed: flag(args, "--seed", "1234").parse().unwrap(),
-        n_threads: flag(args, "--threads", "16").parse().unwrap(),
+        n_threads: flag(args, "--threads", "24").parse().unwrap(),
         n_slots: flag(args, "--slots", "8").parse().unwrap(),
         model_path: flag(args, "--pt2", "serving_model.pt2"),
         weights_path: flag(args, "--weights-st", "serving_weights.safetensors"),

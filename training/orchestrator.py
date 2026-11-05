@@ -67,7 +67,7 @@ def parse_args():
     ap.add_argument("--queue-max", type=int, default=256)
     # The self-play GPU batch width is a fixed constant (net.SERVING_BATCH ==
     # pipeline.rs BATCH): the .pt2 is compiled for exactly that batch.
-    ap.add_argument("--n-threads", type=int, default=16,
+    ap.add_argument("--n-threads", type=int, default=24,
                     help="Self-play MCTS worker threads.")
     # training
     ap.add_argument("--buffer-capacity", type=int, default=200_000)
