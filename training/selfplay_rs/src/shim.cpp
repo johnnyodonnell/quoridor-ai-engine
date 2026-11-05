@@ -5,10 +5,13 @@
 #include <ATen/Context.h>
 #include <ATen/Functions.h> // at::zeros (factory) for the batch-guard probe
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAFunctions.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
+#include <torch/csrc/inductor/aoti_runner/model_container_runner.h>
 #include <cuda_runtime.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -80,6 +83,47 @@ int aoti_check_batch(void* loader_, long batch, long c, long h, long w) {
     } catch (...) {
         return 1;
     }
+}
+
+// In-place weight refresh (no recompile; chess-ai-engine b058439, with two stream
+// races fixed). names[] are the MANGLED constant names (dotted FQN with '.'->'_');
+// tensors[] are tch C_tensor handles (at::Tensor*) on CUDA, bf16. Push them into
+// the INACTIVE constant buffer, re-derive the _FOLDED_CONST_* tensors (requires
+// the .pt2 compiled with use_runtime_constant_folding=True), and swap it live.
+//
+// AOTI orders none of this against a non-default stream, and the inference
+// thread runs on a non-blocking c10 pool stream:
+//   1. update_constant_buffer copies the primaries with plain cudaMemcpy (legacy
+//      default stream). Folding on the caller's stream raced those copies and
+//      produced NaN/garbage (chess's original sequence; reproduced here).
+//   2. run_const_fold hands its outputs over by ownership (no copy) and returns
+//      without waiting, so forwards on the caller's stream after the swap could
+//      read folded constants the fold kernels had not finished writing (~50% of
+//      swaps corrupt on real positions: value mean |Δ| ~0.8 vs fp32).
+// Hence: finish the caller's stream (uploaded tensors complete, no forward in
+// flight), update + fold on the legacy default stream (ordered with AOTI's
+// copies), swap, then synchronize the device so every later forward on any
+// stream sees the finished constants. Measured exact (bit-identical to a
+// natively compiled package) 10/10 under pipeline conditions; on the legacy
+// stream alone it was exact 12/12. The cost is one GPU drain per swap.
+void aoti_swap_weights(void* loader_, const char** names, const void** tensors, int n) {
+    auto* loader = reinterpret_cast<torch::inductor::AOTIModelPackageLoader*>(loader_);
+    auto* runner = loader->get_runner();
+    std::unordered_map<std::string, at::Tensor> map;
+    map.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; i++) {
+        map[std::string(names[i])] = *reinterpret_cast<const at::Tensor*>(tensors[i]);
+    }
+    c10::cuda::getCurrentCUDAStream().synchronize();
+    {
+        c10::cuda::CUDAStreamGuard on_default(c10::cuda::getDefaultCUDAStream());
+        runner->update_constant_buffer(map, /*use_inactive=*/true, /*validate_full_updates=*/false);
+        auto stream = reinterpret_cast<AOTInductorStreamHandle>(
+            c10::cuda::getDefaultCUDAStream().stream());
+        runner->run_const_fold(/*use_inactive=*/true, stream);
+        runner->swap_constant_buffer();
+    }
+    c10::cuda::device_synchronize();
 }
 
 // Enable cuDNN benchmark (algorithm autotuning): picks fast conv algorithms on

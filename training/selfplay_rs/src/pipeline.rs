@@ -32,16 +32,19 @@
 //! With N slots, up to N forwards are queued on the GPU back-to-back, so the
 //! readback/requeue of one batch overlaps the next batch's forward.
 //!
-//! Weight refresh: the trainer re-exports serving_model.pt2 every --pt2-every
-//! (atomic rename). The inference thread mtime-polls it and, on a change, loads
-//! the new package, checks its batch, drains the GPU (forwards in flight still
-//! read the old model's constants) and switches over. Not an in-place AOTI
-//! constant-buffer swap: on real positions that swap corrupted the network
-//! non-deterministically (value mean |Δ| ~0.8 vs fp32), which random-input gates
-//! could not see because they saturate the outputs.
+//! Weight refresh (two mechanisms, both polled by the inference thread between
+//! forwards):
+//!   - swap (default, every --publish-every ~15s): the trainer writes the raw
+//!     weights to serving_weights.safetensors; the worker pushes them into the
+//!     live AOTI constant buffer (chess-ai-engine's design, with the two stream
+//!     races in its swap fixed; see aoti_swap_weights in shim.cpp);
+//!   - reload (optional, --pt2-every): the trainer re-exports serving_model.pt2;
+//!     the worker loads the new package, checks its batch, drains the GPU and
+//!     switches over.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ffi::CString;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -233,8 +236,9 @@ pub struct Config {
     pub seed: u64,
     pub n_threads: usize,
     pub n_slots: usize,       // in-flight forwards / pinned input slots
-    pub model_path: String, // serving_model.pt2 (AOTInductor package; reloaded when it changes)
-    pub reload_every: Duration, // how often to poll the package's mtime
+    pub model_path: String,   // serving_model.pt2 (AOTInductor package; reloaded when it changes)
+    pub weights_path: String, // serving_weights.safetensors (swapped in when it changes; "" = off)
+    pub reload_every: Duration, // how often to poll both files' mtimes
 }
 
 struct Shared {
@@ -485,10 +489,13 @@ struct Infer {
     dev: Device,
     pinned_in: Vec<Tensor>, // N pinned host bf16 [B,8,9,9]
     model_path: String,
+    weights_path: String,
     reload_every: Duration,
     last_check: Instant,
-    last_mtime: Option<std::time::SystemTime>,
+    last_mtime: Option<std::time::SystemTime>,   // of model_path
+    last_w_mtime: Option<std::time::SystemTime>, // of weights_path
     reloads: u64,
+    swaps: u64,
 }
 
 impl Infer {
@@ -498,6 +505,7 @@ impl Infer {
         // Read the mtime BEFORE loading, so a package replaced mid-load is picked
         // up on the next poll rather than missed.
         let last_mtime = std::fs::metadata(&config.model_path).and_then(|m| m.modified()).ok();
+        let last_w_mtime = std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok();
         // A wrong package at startup exits the WHOLE process (not just this
         // thread), so the worker dies loudly and the orchestrator restarts it,
         // rather than hanging with a dead inference thread.
@@ -520,21 +528,64 @@ impl Infer {
             dev,
             pinned_in,
             model_path: config.model_path.clone(),
+            weights_path: config.weights_path.clone(),
             reload_every: config.reload_every,
             last_check: Instant::now(),
             last_mtime,
+            last_w_mtime,
             reloads: 0,
+            swaps: 0,
         }
     }
 
-    /// Poll the package's mtime; on a change, load the new package and switch to
-    /// it. Called by the inference thread between forwards.
+    /// Poll the package's and the weights sidecar's mtimes; reload the package or
+    /// swap in the new weights when they change. Called by the inference thread
+    /// between forwards.
     fn maybe_reload(&mut self) {
         if self.last_check.elapsed() < self.reload_every {
             return;
         }
         self.last_check = Instant::now();
         self.reload_if_changed();
+        self.swap_if_changed();
+    }
+
+    /// Push the trainer's latest weights (serving_weights.safetensors) into the
+    /// live package's constant buffer.
+    fn swap_if_changed(&mut self) {
+        if self.weights_path.is_empty() {
+            return;
+        }
+        let m = std::fs::metadata(&self.weights_path).and_then(|md| md.modified()).ok();
+        if m.is_none() || m == self.last_w_mtime {
+            return;
+        }
+        // The trainer writes the file atomically (tmp + rename), so a changed mtime
+        // means a complete file.
+        let entries = match Tensor::read_safetensors(&self.weights_path) {
+            Ok(v) => v,
+            Err(_) => return, // transient; retry on the next tick
+        };
+        self.last_w_mtime = m;
+        let t = Instant::now();
+        let mut names: Vec<CString> = Vec::with_capacity(entries.len());
+        let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
+        for (name, t) in entries {
+            // AOTI keys constants by the mangled FQN ('.'->'_').
+            names.push(CString::new(name.replace('.', "_")).unwrap());
+            tensors.push(t.to_device(self.dev).to_kind(Kind::BFloat16));
+        }
+        let refs: Vec<&Tensor> = tensors.iter().collect();
+        self.model.swap_weights(&names, &refs); // returns with the GPU drained
+        self.swaps += 1;
+        if self.swaps % 40 == 1 {
+            eprintln!(
+                "selfplay_rs: swapped in {} in {:.0} ms (swap #{})",
+                self.weights_path,
+                t.elapsed().as_secs_f64() * 1e3,
+                self.swaps
+            );
+        }
     }
 
     fn reload_if_changed(&mut self) {
@@ -828,6 +879,84 @@ mod tests {
     }
 }
 
+/// Swap-parity gate (`selfplay_rs swap-parity`): drive the production weight
+/// swap (Infer::swap_if_changed) under pipeline conditions (side stream, a
+/// forward in flight on every slot) and require that after EACH swap the forward
+/// on REAL positions is bit-identical to a natively compiled package of the
+/// swapped-in weights. Alternates B, A, B, A, ... over `cycles` swaps, because the
+/// AOTI swap's failures were non-deterministic (~50% of swaps on a side stream).
+/// Real positions matter: random inputs saturate softmax/tanh and hide corruption.
+/// pkg_a/pkg_b must be compiled with use_runtime_constant_folding=True (as the
+/// trainer exports), and st_a/st_b are their weights as published (bf16).
+pub fn swap_parity(pkg_a: &str, pkg_b: &str, st_a: &str, st_b: &str, positions: &str,
+                   work_dir: &str, cycles: usize) -> bool {
+    let dev = Device::Cuda(0);
+    let b = BATCH as i64;
+    cudagraph::set_side_stream(); // like inference_thread
+    let pos = Tensor::read_safetensors(positions)
+        .unwrap_or_else(|e| panic!("read {positions}: {e}"))
+        .into_iter()
+        .find(|(k, _)| k == "input")
+        .expect("positions file needs an 'input' tensor [N,8,9,9]")
+        .1;
+    let n = pos.size()[0];
+    let x = pos.repeat([(b + n - 1) / n, 1, 1, 1]).narrow(0, 0, b).to_device(dev).to_kind(Kind::BFloat16);
+    let opts = (Kind::BFloat16, dev);
+    let forward = |m: &AotiModel| {
+        let (l, v) = (Tensor::zeros([b, POLICY_SIZE as i64], opts), Tensor::zeros([b], opts));
+        m.run(&x, &l, &v);
+        (l, v)
+    };
+    let refs: Vec<(Tensor, Tensor)> = [pkg_a, pkg_b].iter().map(|p| forward(&AotiModel::load(p))).collect();
+    cudagraph::device_synchronize();
+    let a_vs_b = (&refs[0].1 - &refs[1].1).abs().max().double_value(&[]);
+
+    let sidecar = format!("{work_dir}/swap_parity_weights.safetensors");
+    let install = |src: &str| {
+        let tmp = format!("{sidecar}.tmp");
+        std::fs::copy(src, &tmp).unwrap();
+        std::fs::rename(&tmp, &sidecar).unwrap();
+    };
+    install(st_a); // the package already holds A
+    let config = Config {
+        sims: 1,
+        add_root_noise: false,
+        seed: 0,
+        n_threads: 1,
+        n_slots: 8,
+        model_path: pkg_a.to_string(),
+        weights_path: sidecar.clone(),
+        reload_every: Duration::from_secs(0),
+    };
+    let mut infer = Infer::new(&config, config.n_slots);
+    let enc: Vec<i16> = vec![0; BATCH * ENC_LEN];
+    let mut ok = true;
+    for cycle in 0..cycles {
+        let (src, which) = if cycle % 2 == 0 { (st_b, 1usize) } else { (st_a, 0) };
+        let inflight: Vec<_> = (0..config.n_slots).map(|s| infer.launch(s, &enc, BATCH)).collect();
+        std::thread::sleep(Duration::from_millis(1100)); // mtime granularity
+        install(src);
+        let before = infer.swaps;
+        infer.swap_if_changed();
+        drop(inflight);
+        let (l, v) = forward(&infer.model);
+        cudagraph::device_synchronize();
+        let (rl, rv) = &refs[which];
+        let dl = (&l.to_kind(Kind::Float) - rl.to_kind(Kind::Float)).abs().max().double_value(&[]);
+        let dv = (&v.to_kind(Kind::Float) - rv.to_kind(Kind::Float)).abs().max().double_value(&[]);
+        let swapped = infer.swaps == before + 1;
+        println!(
+            "swap {cycle}: swapped={swapped} -> weights {}  max|Δlogits|={dl:.3e} max|Δvalues|={dv:.3e}",
+            if which == 0 { "A" } else { "B" }
+        );
+        ok &= swapped && dl == 0.0 && dv == 0.0;
+    }
+    let _ = std::fs::remove_file(&sidecar);
+    println!("(A vs B differ by max|Δvalue|={a_vs_b:.3e}, so a stale or corrupt swap would show)");
+    println!("{}", if ok { "SWAP-PARITY OK" } else { "SWAP-PARITY FAILED" });
+    ok
+}
+
 /// Reload-parity gate (`selfplay_rs reload-parity`): drive the production reload
 /// path (Infer::reload_if_changed) under pipeline conditions (side stream,
 /// forwards in flight on every slot) and require that, after each reload, the
@@ -874,6 +1003,7 @@ pub fn reload_parity(pkg_a: &str, pkg_b: &str, positions: &str, work_dir: &str) 
         n_threads: 1,
         n_slots: 8,
         model_path: live.clone(),
+        weights_path: String::new(),
         reload_every: Duration::from_secs(0),
     };
     let mut infer = Infer::new(&config, config.n_slots);

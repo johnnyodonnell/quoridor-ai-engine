@@ -6,6 +6,7 @@
 //!   bench                 run the self-play pipeline, print games/sec
 //!   forward-check <dir>   parity gate: Rust tch net vs PyTorch fixture
 //!   aoti-parity           parity gate: AOTI .pt2 vs torch.compile on the fixture
+//!   swap-parity           parity gate: the worker's weight swap, side stream + real positions
 //!   reload-parity         parity gate: the worker's .pt2 reload path, on real positions
 //!   aoti-time             AOTI forward timing (direct vs CUDA-graph replay)
 //!   time-forward          eager tch forward timing (eager vs CUDA-graph replay)
@@ -230,6 +231,7 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
         n_threads: flag(args, "--threads", "24").parse().unwrap(),
         n_slots: flag(args, "--slots", "2").parse().unwrap(),
         model_path: flag(args, "--pt2", "serving_model.pt2"),
+        weights_path: flag(args, "--weights-st", ""),
         reload_every: Duration::from_secs_f64(flag(args, "--reload-every", "15.0").parse().unwrap()),
     };
     let run = Duration::from_secs_f64(flag(args, "--run", "420").parse().unwrap());
@@ -314,6 +316,19 @@ fn main() {
             let pt2 = flag(&args, "--pt2", "serving_model.pt2");
             std::process::exit(if aoti_parity(&dir, &pt2) { 0 } else { 1 });
         }
+        "swap-parity" => {
+            assert!(tch::Cuda::is_available(), "CUDA not available to tch");
+            let ok = pipeline::swap_parity(
+                &flag(&args, "--pt2-a", "swap_a.pt2"),
+                &flag(&args, "--pt2-b", "swap_b.pt2"),
+                &flag(&args, "--st-a", "swap_a.safetensors"),
+                &flag(&args, "--st-b", "swap_b.safetensors"),
+                &flag(&args, "--positions", "fixture.safetensors"),
+                &flag(&args, "--work-dir", "."),
+                flag(&args, "--cycles", "8").parse().unwrap(),
+            );
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         "reload-parity" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
             let a = flag(&args, "--pt2-a", "reload_a.pt2");
@@ -323,7 +338,7 @@ fn main() {
             std::process::exit(if pipeline::reload_parity(&a, &b, &pos, &dir) { 0 } else { 1 });
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-parity | reload-parity | aoti-time | time-forward");
+            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-parity | swap-parity | reload-parity | aoti-time | time-forward");
             std::process::exit(2);
         }
     }

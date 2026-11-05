@@ -27,6 +27,16 @@ net.load_state_dict(ck["weights"])
 net.eval().to("cuda").bfloat16()
 
 x = torch.zeros(B, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE, device="cuda", dtype=torch.bfloat16)
+# Match the trainer: keep folded constants runtime-updatable so the worker can
+# swap raw weights in via update_constant_buffer + run_const_fold.
+import torch._inductor  # noqa: E402  (ensures torch._inductor.config is loaded)
+torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
+# Keep EVERY weight a swappable constant: Inductor's joint-graph constant
+# folding turns tiny tensors (e.g. the 1-channel value_bn's weight/bias/
+# mean/var) into literals baked into the kernels, which a weight swap can't
+# update, so the value head silently kept its export-time BN. Measured: off ->
+# swaps bit-exact; same accuracy and speed.
+torch._inductor.config.joint_graph_constant_folding = False
 with torch.no_grad():
     ep = torch.export.export(net, (x,))
     path = torch._inductor.aoti_compile_and_package(ep, package_path=OUT)

@@ -6,13 +6,13 @@ worker streams finished games as length-prefixed frames on its stdout; a reader
 thread decodes them onto a bounded queue, and the trainer drains that into a
 ring ReplayBuffer and runs SGD paced to the data rate.
 
-The worker's forward is an AOTInductor package (serving_model.pt2). The trainer
-re-exports it from the current weights at startup and every --pt2-every
-(atomic rename); the worker notices the new file and loads it between batches.
-(Pushing weights into a live package's constant buffer, chess-ai-engine's
-approach, corrupted the network on real positions, so the package is rebuilt
-instead.) serving_weights.pt is still written every --publish-every for
-tooling and warm starts.
+The worker's forward is an AOTInductor package (serving_model.pt2) exported at
+startup with runtime constant folding. Every --publish-every (15s) the trainer
+writes the raw weights to serving_weights.safetensors, which the worker swaps
+into the live package's constant buffer (chess-ai-engine's design; the two CUDA
+stream races in that swap are fixed in selfplay_rs shim.cpp). Optionally
+(--pt2-every > 0) the package itself is also re-exported periodically and the
+worker reloads it. serving_weights.pt is written alongside for tooling.
 
 Every --snapshot-every it writes snapshots/<stem>.safetensors (fp32) + .onnx
 and launches the Rust evaluator (evaluate_rs) detached on the new snapshot
@@ -63,12 +63,13 @@ def parse_args():
     ap.add_argument("--snapshot-every", default="4h")
     ap.add_argument("--save-latest-every", default="300s")
     ap.add_argument("--publish-every", default="15s",
-                    help="How often the trainer writes serving_weights.pt "
-                         "(tooling / warm starts).")
-    ap.add_argument("--pt2-every", default="120s",
-                    help="How often the trainer re-exports serving_model.pt2 "
-                         "from the current weights for the self-play worker "
-                         "(each export blocks the trainer for a few seconds).")
+                    help="How often the trainer publishes weights: "
+                         "serving_weights.safetensors (swapped into the worker's "
+                         "live model) and serving_weights.pt (tooling).")
+    ap.add_argument("--pt2-every", default="0",
+                    help="If > 0, also re-export serving_model.pt2 this often and "
+                         "have the worker reload it (each export blocks the trainer "
+                         "for a few seconds). 0 = export once at startup.")
     # self-play
     ap.add_argument("--sims", type=int, default=200)
     ap.add_argument("--queue-max", type=int, default=256)
@@ -183,12 +184,22 @@ def main():
 
     serving_path = out_dir / "serving_weights.pt"
     # The AOTInductor package (Inductor's fused kernels, no Python) defines the
-    # worker's forward graph and bakes in the weights it was exported with. It is
-    # re-exported every --pt2-every and the worker reloads it when it changes.
+    # worker's forward graph and its initial weights. Compiled with
+    # use_runtime_constant_folding=True so the worker can swap raw weights in and
+    # re-derive the folded constants (BN folded into conv etc.).
     serving_pt2_path = out_dir / "serving_model.pt2"
+    # Raw weights the worker swaps in every publish (bf16, keyed by state_dict FQN).
+    serving_st_path = out_dir / "serving_weights.safetensors"
 
     def _export_pt2(path):
         import torch._inductor  # noqa: F401  (registers aoti_compile_and_package)
+        torch._inductor.config.aot_inductor.use_runtime_constant_folding = True
+        # Keep EVERY weight a swappable constant: Inductor's joint-graph constant
+        # folding turns tiny tensors (e.g. the 1-channel value_bn's weight/bias/
+        # mean/var) into literals baked into the kernels, which a weight swap can't
+        # update, so the value head silently kept its export-time BN. Measured: off ->
+        # swaps bit-exact; same accuracy and speed.
+        torch._inductor.config.joint_graph_constant_folding = False
         ex = QuoridorNet(n_blocks=N_BLOCKS, n_filters=N_FILTERS).to(device).eval()
         ex.load_state_dict(net.state_dict())
         ex = ex.bfloat16()  # self-play runs the forward in bf16
@@ -205,6 +216,14 @@ def main():
 
     def publish_weights():
         _atomic_save(serving_path, {"weights": net.state_dict(), "config": config})
+        # The worker pushes these raw bf16 primaries into the AOTI constant buffer
+        # (mangling FQN '.'->'_'). Drop num_batches_tracked (not an AOTI constant).
+        from safetensors.torch import save_file
+        sd = {k: v.detach().to("cpu", torch.bfloat16).contiguous()
+              for k, v in net.state_dict().items() if "num_batches_tracked" not in k}
+        tmp = str(serving_st_path) + ".tmp"
+        save_file(sd, tmp)
+        os.replace(tmp, str(serving_st_path))
 
     def save_latest():
         _atomic_save(latest_path, {
@@ -298,9 +317,9 @@ def main():
     launch_eval.proc = None
 
     # ----- Spawn the standalone Rust self-play worker -----
-    publish_weights()              # serving_weights.pt (tooling / warm-start)
+    publish_weights()              # serving_weights.safetensors (swapped in) + .pt
     t_export = time.time()
-    _export_pt2(serving_pt2_path)  # the worker's forward (re-exported every --pt2-every)
+    _export_pt2(serving_pt2_path)  # the worker's forward graph + initial weights
     print(f"exported {serving_pt2_path.name} (batch={SERVING_BATCH}) "
           f"in {time.time() - t_export:.0f}s", flush=True)
 
@@ -352,6 +371,7 @@ def main():
         proc = subprocess.Popen(
             [str(SELFPLAY_BIN), "serve",
              "--pt2", str(serving_pt2_path),
+             "--weights-st", str(serving_st_path),
              "--threads", str(args.n_threads),
              "--slots", str(args.n_slots),
              "--sims", str(args.sims),
@@ -452,7 +472,7 @@ def main():
             if now - last_publish >= publish_interval:
                 publish_weights()
                 last_publish = now
-            if now - last_pt2 >= pt2_interval:
+            if pt2_interval > 0 and now - last_pt2 >= pt2_interval:
                 t_export = time.time()
                 _export_pt2(serving_pt2_path)  # the worker reloads it on the mtime change
                 last_pt2 = time.time()
