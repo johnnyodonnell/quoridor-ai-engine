@@ -32,13 +32,16 @@
 //! With N slots, up to N forwards are queued on the GPU back-to-back, so the
 //! readback/requeue of one batch overlaps the next batch's forward.
 //!
-//! Weight hot-reload: the inference thread mtime-polls the safetensors sidecar
-//! the trainer publishes and swaps the raw weights into the live AOTI constant
-//! buffer (no recompile).
+//! Weight refresh: the trainer re-exports serving_model.pt2 every --pt2-every
+//! (atomic rename). The inference thread mtime-polls it and, on a change, loads
+//! the new package, checks its batch, drains the GPU (forwards in flight still
+//! read the old model's constants) and switches over. Not an in-place AOTI
+//! constant-buffer swap: on real positions that swap corrupted the network
+//! non-deterministically (value mean |Δ| ~0.8 vs fp32), which random-input gates
+//! could not see because they saturate the outputs.
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::ffi::CString;
 use std::io::{self, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
@@ -230,9 +233,8 @@ pub struct Config {
     pub seed: u64,
     pub n_threads: usize,
     pub n_slots: usize,       // in-flight forwards / pinned input slots
-    pub model_path: String,   // serving_model.pt2 (AOTInductor graph, loaded once)
-    pub weights_path: String, // serving_weights.safetensors (raw weights swapped in)
-    pub reload_every: Duration,
+    pub model_path: String, // serving_model.pt2 (AOTInductor package; reloaded when it changes)
+    pub reload_every: Duration, // how often to poll the package's mtime
 }
 
 struct Shared {
@@ -463,6 +465,18 @@ struct WorkItem {
     games: Vec<Box<InFlight>>,
 }
 
+/// Load a package and verify it was compiled for BATCH (also a warmup forward).
+/// The .pt2 is exported with a STATIC batch: a mismatch either trips the AOTI
+/// shape check (caught in the shim -> code 1) or silently yields a wrong-sized
+/// output (code 2).
+fn load_checked(path: &str) -> Result<AotiModel, i32> {
+    let model = AotiModel::load(path);
+    match model.check_batch(BATCH as i64) {
+        0 => Ok(model),
+        code => Err(code),
+    }
+}
+
 /// Owns the model + a pool of pinned input buffers. The inference thread fills a
 /// pinned slot, async-copies it to the device, launches the fused AOTI forward,
 /// and records an event, all non-blocking, so forwards queue back-to-back.
@@ -470,28 +484,26 @@ struct Infer {
     model: AotiModel,
     dev: Device,
     pinned_in: Vec<Tensor>, // N pinned host bf16 [B,8,9,9]
-    weights_path: String,
+    model_path: String,
     reload_every: Duration,
     last_check: Instant,
     last_mtime: Option<std::time::SystemTime>,
+    reloads: u64,
 }
 
 impl Infer {
     fn new(config: &Config, n_slots: usize) -> Infer {
         let dev = Device::Cuda(0);
         let b = BATCH as i64;
-        // The .pt2 defines the forward graph + initial weights and is loaded ONCE;
-        // fresh weights arrive via the safetensors sidecar (maybe_reload).
-        let model = AotiModel::load(&config.model_path);
-        // Guard: the package is exported with a STATIC batch, so it must have been
-        // compiled for BATCH. A mismatch either trips the AOTI shape check (caught in
-        // the shim -> code 1) or silently yields a wrong-sized output (code 2). Either
-        // way, exit the WHOLE process (not just panic this thread) so the worker dies
-        // loudly at startup and the orchestrator restarts it, rather than hanging
-        // with a dead inference thread. This probe also serves as a warmup forward.
-        match model.check_batch(b) {
-            0 => {}
-            code => {
+        // Read the mtime BEFORE loading, so a package replaced mid-load is picked
+        // up on the next poll rather than missed.
+        let last_mtime = std::fs::metadata(&config.model_path).and_then(|m| m.modified()).ok();
+        // A wrong package at startup exits the WHOLE process (not just this
+        // thread), so the worker dies loudly and the orchestrator restarts it,
+        // rather than hanging with a dead inference thread.
+        let model = match load_checked(&config.model_path) {
+            Ok(m) => m,
+            Err(code) => {
                 eprintln!(
                     "FATAL: {} was not compiled for BATCH={BATCH} (aoti_check_batch={code}); \
                      re-export the .pt2 at this batch (see SERVING_BATCH in training/net.py)",
@@ -499,7 +511,7 @@ impl Infer {
                 );
                 std::process::exit(1);
             }
-        }
+        };
         let pinned_in = (0..n_slots)
             .map(|_| Tensor::zeros([b, C, S, S], (Kind::BFloat16, Device::Cpu)).pin_memory(dev))
             .collect();
@@ -507,41 +519,54 @@ impl Infer {
             model,
             dev,
             pinned_in,
-            // None (file absent at startup) still reloads once the file appears.
-            last_mtime: std::fs::metadata(&config.weights_path).and_then(|m| m.modified()).ok(),
-            weights_path: config.weights_path.clone(),
+            model_path: config.model_path.clone(),
             reload_every: config.reload_every,
             last_check: Instant::now(),
+            last_mtime,
+            reloads: 0,
         }
     }
 
+    /// Poll the package's mtime; on a change, load the new package and switch to
+    /// it. Called by the inference thread between forwards.
     fn maybe_reload(&mut self) {
         if self.last_check.elapsed() < self.reload_every {
             return;
         }
         self.last_check = Instant::now();
-        let m = std::fs::metadata(&self.weights_path).and_then(|md| md.modified()).ok();
+        self.reload_if_changed();
+    }
+
+    fn reload_if_changed(&mut self) {
+        let m = std::fs::metadata(&self.model_path).and_then(|md| md.modified()).ok();
         if m.is_none() || m == self.last_mtime {
             return;
         }
-        // Trainer published fresh weights: read the safetensors sidecar, move the raw
-        // primaries to CUDA bf16, and push them into the live AOTI constant buffer
-        // (update_constant_buffer -> run_const_fold -> swap). The trainer writes the
-        // file atomically (rename), so a changed mtime means a complete file.
-        let entries = match Tensor::read_safetensors(&self.weights_path) {
-            Ok(v) => v,
-            Err(_) => return, // transient; retry on the next tick
-        };
-        let mut names: Vec<CString> = Vec::with_capacity(entries.len());
-        let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
-        for (name, t) in entries {
-            // AOTI keys constants by the mangled FQN ('.'->'_').
-            names.push(CString::new(name.replace('.', "_")).unwrap());
-            tensors.push(t.to_device(self.dev).to_kind(Kind::BFloat16));
-        }
-        let refs: Vec<&Tensor> = tensors.iter().collect();
-        self.model.swap_weights(&names, &refs);
+        // The trainer writes the package atomically (tmp file + rename), so a
+        // changed mtime means a complete new package.
         self.last_mtime = m;
+        let t = Instant::now();
+        match load_checked(&self.model_path) {
+            Ok(new_model) => {
+                // Forwards already in flight (up to n_slots) were launched with the
+                // old model and read its constants until they finish: drain the GPU
+                // before the old model is freed.
+                cudagraph::device_synchronize();
+                self.model = new_model; // the old package is dropped (freed) here
+                self.reloads += 1;
+                eprintln!(
+                    "selfplay_rs: reloaded {} in {:.0} ms (reload #{})",
+                    self.model_path,
+                    t.elapsed().as_secs_f64() * 1e3,
+                    self.reloads
+                );
+            }
+            Err(code) => eprintln!(
+                "warn: reloaded {} failed the batch check (aoti_check_batch={code}); \
+                 keeping the current model",
+                self.model_path
+            ),
+        }
     }
 
     /// Fill pinned slot `slot` with `m` rows, async-H2D, launch the forward, and
@@ -801,6 +826,83 @@ mod tests {
             assert!(ours.to_bits() == theirs[i].to_bits() || (ours.is_nan() && theirs[i].is_nan()));
         }
     }
+}
+
+/// Reload-parity gate (`selfplay_rs reload-parity`): drive the production reload
+/// path (Infer::reload_if_changed) under pipeline conditions (side stream,
+/// forwards in flight on every slot) and require that, after each reload, the
+/// forward on REAL positions equals a freshly loaded copy of the same package.
+/// Alternates A -> B -> A -> B so both directions and repeated reloads are
+/// covered. Real positions matter: random inputs saturate the policy softmax and
+/// the value tanh, which hid the AOTI constant-swap corruption.
+pub fn reload_parity(pkg_a: &str, pkg_b: &str, positions: &str, work_dir: &str) -> bool {
+    let dev = Device::Cuda(0);
+    let b = BATCH as i64;
+    cudagraph::set_side_stream(); // like inference_thread
+    let pos = Tensor::read_safetensors(positions)
+        .unwrap_or_else(|e| panic!("read {positions}: {e}"))
+        .into_iter()
+        .find(|(k, _)| k == "input")
+        .expect("positions file needs an 'input' tensor [N,8,9,9]")
+        .1;
+    let n = pos.size()[0];
+    let reps = (b + n - 1) / n;
+    let x = pos.repeat([reps, 1, 1, 1]).narrow(0, 0, b).to_device(dev).to_kind(Kind::BFloat16);
+    let opts = (Kind::BFloat16, dev);
+    let forward = |m: &AotiModel| {
+        let (l, v) = (Tensor::zeros([b, POLICY_SIZE as i64], opts), Tensor::zeros([b], opts));
+        m.run(&x, &l, &v);
+        (l, v)
+    };
+    // Reference outputs from fresh loads of each package.
+    let refs: Vec<(Tensor, Tensor)> = [pkg_a, pkg_b].iter().map(|p| forward(&AotiModel::load(p))).collect();
+    cudagraph::device_synchronize();
+    let a_vs_b = (&refs[0].1 - &refs[1].1).abs().max().double_value(&[]);
+
+    let live = format!("{work_dir}/reload_parity_live.pt2");
+    let install = |src: &str| {
+        // Same as the trainer: write a temp file, then rename over the live path.
+        let tmp = format!("{live}.tmp");
+        std::fs::copy(src, &tmp).unwrap();
+        std::fs::rename(&tmp, &live).unwrap();
+    };
+    install(pkg_a);
+    let config = Config {
+        sims: 1,
+        add_root_noise: false,
+        seed: 0,
+        n_threads: 1,
+        n_slots: 8,
+        model_path: live.clone(),
+        reload_every: Duration::from_secs(0),
+    };
+    let mut infer = Infer::new(&config, config.n_slots);
+    let enc: Vec<i16> = vec![0; BATCH * ENC_LEN];
+    let mut ok = true;
+    for (cycle, (src, which)) in [(pkg_b, 1usize), (pkg_a, 0), (pkg_b, 1), (pkg_a, 0)].iter().enumerate() {
+        // Fill every slot with a forward in flight, then publish the next package.
+        let inflight: Vec<_> = (0..config.n_slots).map(|s| infer.launch(s, &enc, BATCH)).collect();
+        std::thread::sleep(Duration::from_millis(1100)); // mtime granularity
+        install(src);
+        let before = infer.reloads;
+        infer.reload_if_changed();
+        drop(inflight);
+        let (l, v) = forward(&infer.model);
+        cudagraph::device_synchronize();
+        let (rl, rv) = &refs[*which];
+        let dl = (&l.to_kind(Kind::Float) - rl.to_kind(Kind::Float)).abs().max().double_value(&[]);
+        let dv = (&v.to_kind(Kind::Float) - rv.to_kind(Kind::Float)).abs().max().double_value(&[]);
+        let reloaded = infer.reloads == before + 1;
+        println!(
+            "cycle {cycle}: reloaded={reloaded} -> package {}  max|Δlogits|={dl:.3e} max|Δvalues|={dv:.3e}",
+            if *which == 0 { "A" } else { "B" }
+        );
+        ok &= reloaded && dl == 0.0 && dv == 0.0;
+    }
+    let _ = std::fs::remove_file(&live);
+    println!("(A vs B differ by max|Δvalue|={a_vs_b:.3e}, so a stale model would show)");
+    println!("{}", if ok { "RELOAD-PARITY OK" } else { "RELOAD-PARITY FAILED" });
+    ok
 }
 
 // --- serve mode (production IPC) ---------------------------------------------

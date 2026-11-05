@@ -6,7 +6,7 @@
 //!   bench                 run the self-play pipeline, print games/sec
 //!   forward-check <dir>   parity gate: Rust tch net vs PyTorch fixture
 //!   aoti-parity           parity gate: AOTI .pt2 vs torch.compile on the fixture
-//!   aoti-swap-parity      parity gate: in-place weight swap vs a natively compiled .pt2
+//!   reload-parity         parity gate: the worker's .pt2 reload path, on real positions
 //!   aoti-time             AOTI forward timing (direct vs CUDA-graph replay)
 //!   time-forward          eager tch forward timing (eager vs CUDA-graph replay)
 
@@ -15,7 +15,6 @@ mod cudagraph;
 mod pipeline;
 
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::time::Duration;
 
 use quoridor_core::board::{INPUT_CHANNELS, POLICY_SIZE, SIZE};
@@ -231,7 +230,6 @@ fn bench_config(args: &[String]) -> (Config, Duration, Duration) {
         n_threads: flag(args, "--threads", "24").parse().unwrap(),
         n_slots: flag(args, "--slots", "8").parse().unwrap(),
         model_path: flag(args, "--pt2", "serving_model.pt2"),
-        weights_path: flag(args, "--weights-st", "serving_weights.safetensors"),
         reload_every: Duration::from_secs_f64(flag(args, "--reload-every", "15.0").parse().unwrap()),
     };
     let run = Duration::from_secs_f64(flag(args, "--run", "420").parse().unwrap());
@@ -277,66 +275,6 @@ fn aoti_parity(dir: &str, pt2: &str) -> bool {
     ok
 }
 
-/// Swap-parity gate: prove the in-place weight swap (update_constant_buffer ->
-/// run_const_fold -> swap) is correct. Push W2's weights into a package compiled
-/// for W1, and require its forward to match a package compiled NATIVELY for W2
-/// (same fusion on both sides, so any diff is purely the swap). The Python helper
-/// `make_swap_fixture.py` produces the two .pt2s + W2.safetensors.
-fn aoti_swap_parity(pt2_w1: &str, pt2_w2: &str, weights_w2: &str, b: i64) -> bool {
-    let dev = Device::Cuda(0);
-    let model = aoti::AotiModel::load(pt2_w1); // compiled for W1; we push W2 into this
-    let model_ref = aoti::AotiModel::load(pt2_w2); // compiled natively for W2
-    let model_w1 = aoti::AotiModel::load(pt2_w1); // untouched native W1 (staleness probe)
-
-    // Push W2's raw primaries into the W1 package (mangled FQNs, CUDA bf16).
-    let entries = Tensor::read_safetensors(weights_w2)
-        .unwrap_or_else(|e| panic!("read {weights_w2}: {e}"));
-    let mut names: Vec<CString> = Vec::with_capacity(entries.len());
-    let mut tensors: Vec<Tensor> = Vec::with_capacity(entries.len());
-    for (name, t) in entries {
-        names.push(CString::new(name.replace('.', "_")).unwrap());
-        tensors.push(t.to_device(dev).to_kind(Kind::BFloat16));
-    }
-    let refs: Vec<&Tensor> = tensors.iter().collect();
-    model.swap_weights(&names, &refs);
-
-    // Same input through all three; compare the move prior (full softmax) + values.
-    let x = Tensor::randn([b, C, S, S], (Kind::BFloat16, dev));
-    let opts = (Kind::BFloat16, dev);
-    let (out_l, out_v) = (Tensor::zeros([b, P], opts), Tensor::zeros([b], opts));
-    let (ref_l, ref_v) = (Tensor::zeros([b, P], opts), Tensor::zeros([b], opts));
-    let (w1_l, w1_v) = (Tensor::zeros([b, P], opts), Tensor::zeros([b], opts));
-    model.run(&x, &out_l, &out_v);
-    model_ref.run(&x, &ref_l, &ref_v);
-    model_w1.run(&x, &w1_l, &w1_v);
-    cudagraph::device_synchronize();
-
-    let softmax = |l: &Tensor| l.to_kind(Kind::Float).softmax(1, Kind::Float);
-    let mean_abs = |a: &Tensor, b: &Tensor| {
-        (a.to_kind(Kind::Float) - b.to_kind(Kind::Float)).abs().mean(Kind::Float).double_value(&[])
-    };
-    let prior_dmax = max_abs_diff(&softmax(&out_l), &softmax(&ref_l));
-    let value_dmax = max_abs_diff(&out_v, &ref_v);
-    let value_dmean = mean_abs(&out_v, &ref_v);
-    let logit_dmax = max_abs_diff(&out_l, &ref_l);
-    // Staleness probe: how far is the pushed result from an UNTOUCHED W1 package?
-    // ~0 vs W1 means that head ignored the swap; ~0 vs W2 means it took effect.
-    let val_vs_w1 = max_abs_diff(&out_v, &w1_v);
-    let logit_vs_w1 = max_abs_diff(&out_l, &w1_l);
-    let w1w2_val = max_abs_diff(&w1_v, &ref_v);
-    let w1w2_logit = max_abs_diff(&w1_l, &ref_l);
-    println!("AOTI swap-parity (push-W2 into W1-pkg vs native-W2, B={b}):");
-    println!("  prior (full softmax) max|Δprob|={prior_dmax:.3e}  (raw logit max|Δ|={logit_dmax:.3e})");
-    println!("  value max|Δ|={value_dmax:.3e}  mean|Δ|={value_dmean:.3e}");
-    println!("  staleness: value |pushed-W1|={val_vs_w1:.3e} (W1↔W2 gap={w1w2_val:.3e})  \
-              logit |pushed-W1|={logit_vs_w1:.3e} (W1↔W2 gap={w1w2_logit:.3e})");
-    // Policy prior must match; value is bf16-sensitive (run_const_fold vs compile
-    // fold), so gate it on the mean over the batch, not rare tanh-boundary outliers.
-    let ok = prior_dmax < 2.0e-2 && value_dmean < 2.0e-2;
-    println!("{}", if ok { "AOTI-SWAP-PARITY OK" } else { "AOTI-SWAP-PARITY FAILED" });
-    ok
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
@@ -376,16 +314,16 @@ fn main() {
             let pt2 = flag(&args, "--pt2", "serving_model.pt2");
             std::process::exit(if aoti_parity(&dir, &pt2) { 0 } else { 1 });
         }
-        "aoti-swap-parity" => {
+        "reload-parity" => {
             assert!(tch::Cuda::is_available(), "CUDA not available to tch");
-            let pt2_w1 = flag(&args, "--pt2-w1", "swap_w1.pt2");
-            let pt2_w2 = flag(&args, "--pt2-w2", "swap_w2.pt2");
-            let weights_w2 = flag(&args, "--weights-w2", "swap_w2.safetensors");
-            let b: i64 = flag(&args, "--batch", "512").parse().unwrap();
-            std::process::exit(if aoti_swap_parity(&pt2_w1, &pt2_w2, &weights_w2, b) { 0 } else { 1 });
+            let a = flag(&args, "--pt2-a", "reload_a.pt2");
+            let b = flag(&args, "--pt2-b", "reload_b.pt2");
+            let pos = flag(&args, "--positions", "fixture.safetensors");
+            let dir = flag(&args, "--work-dir", ".");
+            std::process::exit(if pipeline::reload_parity(&a, &b, &pos, &dir) { 0 } else { 1 });
         }
         other => {
-            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-parity | aoti-swap-parity | aoti-time | time-forward");
+            eprintln!("unknown subcommand {other:?}; expected: serve | bench | forward-check | aoti-parity | reload-parity | aoti-time | time-forward");
             std::process::exit(2);
         }
     }

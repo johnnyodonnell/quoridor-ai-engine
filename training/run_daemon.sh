@@ -43,6 +43,7 @@ exec "$VENV/bin/python" orchestrator.py \
   --out-dir "$OUT_DIR" \
   --snapshot-every "${SNAPSHOT_EVERY:-4h}" \
   --save-latest-every 300s \
+  --pt2-every "${PT2_EVERY:-120s}" \
   --sims "${SIMS:-200}" \
   --n-threads "${N_THREADS:-24}" \
   --eval-args "${EVAL_ARGS:-}" \

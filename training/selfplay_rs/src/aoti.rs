@@ -5,7 +5,7 @@
 //! under the hood); outputs are copied into caller-owned tch tensors.
 
 use std::ffi::{c_void, CString};
-use std::os::raw::{c_char, c_long};
+use std::os::raw::c_long;
 
 use quoridor_core::board::{INPUT_CHANNELS, SIZE};
 use tch::Tensor;
@@ -15,12 +15,6 @@ extern "C" {
     fn aoti_run(loader: *mut c_void, input: *const c_void, out_logits: *const c_void, out_values: *const c_void);
     fn aoti_check_batch(loader: *mut c_void, batch: c_long, c: c_long, h: c_long, w: c_long) -> i32;
     fn aoti_free(loader: *mut c_void);
-    fn aoti_swap_weights(
-        loader: *mut c_void,
-        names: *const *const c_char,
-        tensors: *const *const c_void,
-        n: i32,
-    );
 }
 
 pub struct AotiModel {
@@ -64,26 +58,6 @@ impl AotiModel {
                 SIZE as c_long,
                 SIZE as c_long,
             )
-        }
-    }
-
-    /// Refresh the model weights in place (no recompile): push the given constants
-    /// into the inactive buffer, re-derive folded constants, and swap live. `names`
-    /// are MANGLED constant names (dotted FQN with '.'->'_'); `tensors` are the
-    /// matching CUDA bf16 tensors (H2D-copied here, so they may drop afterward).
-    /// Must be called from the inference thread (single reader, between forwards).
-    pub fn swap_weights(&self, names: &[CString], tensors: &[&Tensor]) {
-        assert_eq!(names.len(), tensors.len(), "names/tensors length mismatch");
-        let name_ptrs: Vec<*const c_char> = names.iter().map(|c| c.as_ptr()).collect();
-        let tensor_ptrs: Vec<*const c_void> =
-            tensors.iter().map(|t| t.as_ptr() as *const c_void).collect();
-        unsafe {
-            aoti_swap_weights(
-                self.raw,
-                name_ptrs.as_ptr(),
-                tensor_ptrs.as_ptr(),
-                names.len() as i32,
-            );
         }
     }
 }
